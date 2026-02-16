@@ -6,7 +6,6 @@ import re
 import gc
 from collections import Counter
 from datetime import datetime
-import pytz
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -31,7 +30,7 @@ def get_client():
     return bigquery.Client(credentials=creds,project=creds.project_id)
 
 # =====================================================
-# LOAD
+# LOAD DATA
 # =====================================================
 
 @st.cache_data(ttl=600)
@@ -48,6 +47,7 @@ def load():
     if df.empty:
         return df
 
+    # clean
     df["rating"]=pd.to_numeric(df["rating"],errors="coerce")
     df["at"]=pd.to_datetime(df["date"],utc=True,errors="coerce")
     df=df.dropna(subset=["at"])
@@ -58,6 +58,7 @@ def load():
 
     df["score"]=df["rating"]
 
+    # sentiment fallback
     if "sentiment" not in df.columns:
         df["Sentiment_Label"]=pd.cut(df["score"],[0,2,3,5],labels=["Negative","Neutral","Positive"])
     else:
@@ -75,42 +76,85 @@ def load():
 
     st.session_state["themes"]=themes
     st.session_state["last"]=datetime.now().strftime("%H:%M:%S")
+
+    gc.collect()
     return df
 
 df_raw=load()
 if df_raw.empty:
-    st.error("No data")
+    st.error("No data returned")
     st.stop()
 
 themes=st.session_state["themes"]
 
 # =====================================================
-# FILTERS
+# SIDEBAR FILTERS
 # =====================================================
 
 with st.sidebar:
 
     st.title("Filters")
 
-    dr=st.date_input("Date",[df_raw["at"].min().date(),df_raw["at"].max().date()])
+    mode=st.selectbox(
+        "Time Range",
+        ["Last 7 Days","Last 1 Month","Last 3 Months","Last 6 Months","Quarter","Custom Range"],
+        index=2
+    )
+
+    today=pd.Timestamp.today(tz="Asia/Kolkata")
+
+    if mode=="Last 7 Days":
+        start=today-pd.Timedelta(days=7)
+
+    elif mode=="Last 1 Month":
+        start=today-pd.DateOffset(months=1)
+
+    elif mode=="Last 3 Months":
+        start=today-pd.DateOffset(months=3)
+
+    elif mode=="Last 6 Months":
+        start=today-pd.DateOffset(months=6)
+
+    elif mode=="Quarter":
+        start=today-pd.DateOffset(months=3)
+
+    else:
+        custom=st.date_input("Select Range",[df_raw["at"].min().date(),df_raw["at"].max().date()])
+        if len(custom)==2:
+            start=pd.Timestamp(custom[0],tz="Asia/Kolkata")
+            today=pd.Timestamp(custom[1],tz="Asia/Kolkata")
+
+    # brand
     brands=sorted(df_raw["brand_name"].dropna().unique())
     sel_brands=st.multiselect("Brand",brands,brands)
+
+    # rating
     ratings=st.multiselect("Rating",[1,2,3,4,5],[1,2,3,4,5])
 
+    # sentiment
     sents=sorted(df_raw["Sentiment_Label"].dropna().unique())
     sel_sents=st.multiselect("Sentiment",sents,sents)
 
+    # product
+    if "product" in df_raw.columns:
+        prods=sorted(df_raw["product"].dropna().unique())
+        sel_prods=st.multiselect("Product",prods,prods)
+    else:
+        sel_prods=[]
+
+# =====================================================
+# APPLY FILTER
+# =====================================================
+
 mask=pd.Series(True,index=df_raw.index)
 
-if len(dr)==2:
-    mask &= df_raw["at"].between(
-        pd.to_datetime(dr[0]).tz_localize("Asia/Kolkata"),
-        pd.to_datetime(dr[1]).tz_localize("Asia/Kolkata")
-    )
-
+mask &= df_raw["at"].between(start,today)
 mask &= df_raw["brand_name"].isin(sel_brands)
 mask &= df_raw["score"].isin(ratings)
 mask &= df_raw["Sentiment_Label"].isin(sel_sents)
+
+if sel_prods and "product" in df_raw.columns:
+    mask &= df_raw["product"].isin(sel_prods)
 
 df=df_raw[mask]
 
@@ -140,16 +184,8 @@ c4.metric("Critical Risk %",round(risk,1))
 # =====================================================
 
 tabs=st.tabs([
-"Overview",
-"Brands",
-"Triggers",
-"Barriers",
-"Text",
-"Cohorts",
-"Anomalies",
-"Theme Trends",
-"Brand Compare",
-"Executive Summary"
+"Overview","Brands","Triggers","Barriers","Text",
+"Cohorts","Anomalies","Theme Trends","Brand Compare","Executive Summary"
 ])
 
 # =====================================================
@@ -220,7 +256,7 @@ with tabs[4]:
         st.bar_chart(w.set_index("Word"))
 
 # =====================================================
-# COHORTS
+# COHORT
 # =====================================================
 
 with tabs[5]:
@@ -228,32 +264,30 @@ with tabs[5]:
     st.plotly_chart(px.line(cohort,x="Month",y="Reviews",color="brand_name"),use_container_width=True)
 
 # =====================================================
-# ANOMALIES
+# ANOMALY
 # =====================================================
 
 with tabs[6]:
     d=df.groupby("Week").size().reset_index(name="Reviews")
-    d["z"]= (d["Reviews"]-d["Reviews"].mean())/d["Reviews"].std()
-    anomalies=d[abs(d["z"])>2]
+    d["z"]=(d["Reviews"]-d["Reviews"].mean())/d["Reviews"].std()
     st.plotly_chart(px.line(d,x="Week",y="Reviews"),use_container_width=True)
-    st.dataframe(anomalies)
+    st.dataframe(d[abs(d["z"])>2])
 
 # =====================================================
-# THEME TRENDS
+# THEME TREND
 # =====================================================
 
 with tabs[7]:
     if themes:
-        tsel=st.selectbox("Theme",themes)
+        sel=st.selectbox("Theme",themes)
         rows=[]
         for m,g in df.groupby("Month"):
-            pct=g[tsel].sum()/len(g)*100 if tsel in g else 0
-            rows.append([m,pct])
+            rows.append([m,g[sel].sum()/len(g)*100 if sel in g else 0])
         td=pd.DataFrame(rows,columns=["Month","Pct"])
         st.plotly_chart(px.line(td,x="Month",y="Pct"),use_container_width=True)
 
 # =====================================================
-# BRAND COMPARE
+# COMPARE
 # =====================================================
 
 with tabs[8]:
@@ -268,16 +302,13 @@ with tabs[8]:
 # =====================================================
 
 with tabs[9]:
-
-    worst=df.groupby("brand_name")["score"].mean().idxmin()
     best=df.groupby("brand_name")["score"].mean().idxmax()
+    worst=df.groupby("brand_name")["score"].mean().idxmin()
 
-    st.success(f"Best performing brand → {best}")
+    st.success(f"Best performing → {best}")
     st.error(f"Needs attention → {worst}")
 
     if themes:
-        impact=[]
-        for t in themes:
-            impact.append((t,df[t].sum()))
+        impact=[(t,df[t].sum()) for t in themes]
         worst_theme=sorted(impact,key=lambda x:x[1],reverse=True)[0][0]
         st.warning(f"Top complaint driver → {worst_theme}")
