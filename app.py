@@ -1,11 +1,5 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-import numpy as np
-import re
-import gc
-from collections import Counter
-from datetime import datetime
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -13,18 +7,18 @@ from google.oauth2 import service_account
 # CONFIG
 # =====================================================
 
-PROJECT_ID="app-review-analyzer-487309"
+PROJECT="app-review-analyzer-487309"
 DATASET="app_reviews_ds"
 TABLE="raw_reviews"
 
-st.set_page_config(page_title="Strategic Intelligence Platform",layout="wide")
+st.set_page_config(layout="wide")
 
 # =====================================================
-# CLIENT
+# BQ CLIENT
 # =====================================================
 
 @st.cache_resource
-def get_client():
+def client():
     key="gcp_service_account" if "gcp_service_account" in st.secrets else "GCP_SERVICE_ACCOUNT"
     creds=service_account.Credentials.from_service_account_info(dict(st.secrets[key]))
     return bigquery.Client(credentials=creds,project=creds.project_id)
@@ -38,277 +32,137 @@ def load():
 
     q=f"""
     SELECT *
-    FROM `{PROJECT_ID}.{DATASET}.{TABLE}`
+    FROM `{PROJECT}.{DATASET}.{TABLE}`
     WHERE DATE(date)>=DATE_SUB(CURRENT_DATE(),INTERVAL 365 DAY)
     """
 
-    df=get_client().query(q).to_dataframe()
+    df=client().query(q).to_dataframe()
 
-    if df.empty:
-        return df
-
-    # clean
     df["rating"]=pd.to_numeric(df["rating"],errors="coerce")
-    df["at"]=pd.to_datetime(df["date"],utc=True,errors="coerce")
-    df=df.dropna(subset=["at"])
-    df["at"]=df["at"].dt.tz_convert("Asia/Kolkata")
+    df["date"]=pd.to_datetime(df["date"],errors="coerce")
+    df=df.dropna(subset=["date"])
 
-    df["Month"]=df["at"].dt.to_period("M").astype(str)
-    df["Week"]=df["at"].dt.strftime("%Y-W%V")
+    df["Month"]=df["date"].dt.to_period("M").astype(str)
 
-    df["score"]=df["rating"]
-
-    # sentiment fallback
-    if "sentiment" not in df.columns:
-        df["Sentiment_Label"]=pd.cut(df["score"],[0,2,3,5],labels=["Negative","Neutral","Positive"])
-    else:
-        df["Sentiment_Label"]=df["sentiment"]
-
-    # detect theme cols
-    themes=[]
-    for c in df.columns:
-        try:
-            u=df[c].dropna().unique()
-            if len(u)<=2 and set(u).issubset({0,1}):
-                themes.append(c)
-        except:
-            pass
-
-    st.session_state["themes"]=themes
-    st.session_state["last"]=datetime.now().strftime("%H:%M:%S")
-
-    gc.collect()
     return df
 
-df_raw=load()
-if df_raw.empty:
-    st.error("No data returned")
-    st.stop()
-
-themes=st.session_state["themes"]
+df=load()
 
 # =====================================================
-# SIDEBAR FILTERS
+# HELPERS
 # =====================================================
 
-with st.sidebar:
+def normalize_brand(x):
+    s=str(x).lower()
+    if "moneyview" in s: return "MoneyView"
+    if "kreditbee" in s: return "KreditBee"
+    if "navi" in s: return "Navi"
+    if "kissht" in s: return "Kissht"
+    return None
 
-    st.title("Filters")
+def is_pl(row):
+    for c in ["Product_1","Product_2","Product_3","Product_4"]:
+        if c in row and pd.notna(row[c]):
+            v=str(row[c]).lower()
+            if "loan" in v or "pl" in v or "personal" in v:
+                return True
+    return False
 
-    mode=st.selectbox(
-        "Time Range",
-        ["Last 7 Days","Last 1 Month","Last 3 Months","Last 6 Months","Quarter","Custom Range"],
-        index=2
-    )
-
-    today=pd.Timestamp.today(tz="Asia/Kolkata")
-
-    if mode=="Last 7 Days":
-        start=today-pd.Timedelta(days=7)
-
-    elif mode=="Last 1 Month":
-        start=today-pd.DateOffset(months=1)
-
-    elif mode=="Last 3 Months":
-        start=today-pd.DateOffset(months=3)
-
-    elif mode=="Last 6 Months":
-        start=today-pd.DateOffset(months=6)
-
-    elif mode=="Quarter":
-        start=today-pd.DateOffset(months=3)
-
-    else:
-        custom=st.date_input("Select Range",[df_raw["at"].min().date(),df_raw["at"].max().date()])
-        if len(custom)==2:
-            start=pd.Timestamp(custom[0],tz="Asia/Kolkata")
-            today=pd.Timestamp(custom[1],tz="Asia/Kolkata")
-
-    # brand
-    brands=sorted(df_raw["brand_name"].dropna().unique())
-    sel_brands=st.multiselect("Brand",brands,brands)
-
-    # rating
-    ratings=st.multiselect("Rating",[1,2,3,4,5],[1,2,3,4,5])
-
-    # sentiment
-    sents=sorted(df_raw["Sentiment_Label"].dropna().unique())
-    sel_sents=st.multiselect("Sentiment",sents,sents)
-
-    # product
-    if "product" in df_raw.columns:
-        prods=sorted(df_raw["product"].dropna().unique())
-        sel_prods=st.multiselect("Product",prods,prods)
-    else:
-        sel_prods=[]
+theme_cols=[c for c in df.columns if str(c).startswith("Theme_")]
 
 # =====================================================
-# APPLY FILTER
+# CORE BUILDER
 # =====================================================
 
-mask=pd.Series(True,index=df_raw.index)
+def build_table(ratings):
 
-mask &= df_raw["at"].between(start,today)
-mask &= df_raw["brand_name"].isin(sel_brands)
-mask &= df_raw["score"].isin(ratings)
-mask &= df_raw["Sentiment_Label"].isin(sel_sents)
+    d=df[df["rating"].isin(ratings)].copy()
 
-if sel_prods and "product" in df_raw.columns:
-    mask &= df_raw["product"].isin(sel_prods)
+    d["Brand"]=d["App_Name"].apply(normalize_brand)
+    d=d.dropna(subset=["Brand"])
 
-df=df_raw[mask]
+    d=d[d.apply(is_pl,axis=1)]
 
-# =====================================================
-# KPI STRIP
-# =====================================================
+    months=sorted(d["Month"].unique())[-6:]
+    brands=sorted(d["Brand"].unique(),key=lambda x:(x!="MoneyView",x))
 
-st.title("Strategic Intelligence Platform")
-st.caption(f"Updated → {st.session_state['last']}")
+    # base
+    base=d.groupby(["Brand","Month"]).size().unstack(fill_value=0)
 
-c1,c2,c3,c4=st.columns(4)
+    net_data={}
 
-vol=len(df)
-avg=df["score"].mean()
-prom=len(df[df.score==5])
-det=len(df[df.score<=3])
-nps=((prom-det)/vol*100) if vol else 0
-risk=len(df[df.score==1])/vol*100 if vol else 0
+    for _,r in d.iterrows():
 
-c1.metric("Volume",vol)
-c2.metric("Avg Rating",round(avg,2))
-c3.metric("NPS Proxy",round(nps))
-c4.metric("Critical Risk %",round(risk,1))
+        nets=set()
+        themes=set()
 
-# =====================================================
-# TABS
-# =====================================================
+        for c in theme_cols:
+            if pd.notna(r[c]) and r[c]!="":
+                net=r[c]
+                nets.add(net)
+                themes.add((net,str(r[c]).title()))
 
-tabs=st.tabs([
-"Overview","Brands","Triggers","Barriers","Text",
-"Cohorts","Anomalies","Theme Trends","Brand Compare","Executive Summary"
-])
+        for net in nets:
+            net_data.setdefault(net,{}).setdefault("_TOTAL",{}).setdefault(r["Brand"],{}).setdefault(r["Month"],0)
+            net_data[net]["_TOTAL"][r["Brand"]][r["Month"]]+=1
 
-# =====================================================
-# OVERVIEW
-# =====================================================
+        for net,theme in themes:
+            net_data.setdefault(net,{}).setdefault(theme,{}).setdefault(r["Brand"],{}).setdefault(r["Month"],0)
+            net_data[net][theme][r["Brand"]][r["Month"]]+=1
 
-with tabs[0]:
-    t=df.groupby("Month").agg(Reviews=("score","count"),Rating=("score","mean")).reset_index()
-    st.plotly_chart(px.line(t,x="Month",y="Reviews"),use_container_width=True)
-    st.plotly_chart(px.line(t,x="Month",y="Rating"),use_container_width=True)
+    # sort nets by latest MV %
+    latest=months[-1] if months else None
 
-# =====================================================
-# BRANDS
-# =====================================================
+    def mv_pct(obj):
+        b=base.get(latest,{}).get("MoneyView",0) if latest in base.columns else 0
+        v=obj.get("MoneyView",{}).get(latest,0)
+        return v/b if b else 0
 
-with tabs[1]:
-    b=df.groupby("brand_name").agg(Reviews=("score","count"),Rating=("score","mean")).reset_index()
-    st.dataframe(b,use_container_width=True)
-    st.plotly_chart(px.scatter(b,x="Reviews",y="Rating",size="Reviews",hover_name="brand_name"),use_container_width=True)
+    sorted_nets=sorted(net_data.keys(),key=lambda n:mv_pct(net_data[n]["_TOTAL"]),reverse=True)
 
-# =====================================================
-# TRIGGERS
-# =====================================================
-
-with tabs[2]:
-    pos=df[df.score>=4]
+    # build table
     rows=[]
-    for t in themes:
-        if t in pos.columns:
-            c=pos[t].sum()
-            if c>0:
-                rows.append([t,c/len(pos)*100])
-    if rows:
-        d=pd.DataFrame(rows,columns=["Theme","Pct"]).sort_values("Pct",ascending=False)
-        st.dataframe(d)
-        st.bar_chart(d.set_index("Theme"))
+
+    header=["NET"]+[f"{m}-{b}" for m in months for b in brands]
+    rows.append(header)
+
+    base_row=["BASE"]
+    for m in months:
+        for b in brands:
+            base_row.append(base.get(m,{}).get(b,0))
+    rows.append(base_row)
+
+    for net in sorted_nets:
+
+        def make_row(label,obj):
+            r=[label]
+            for m in months:
+                for b in brands:
+                    bcount=base.get(m,{}).get(b,0)
+                    v=obj.get(b,{}).get(m,0)
+                    r.append(v/bcount if bcount else 0)
+            return r
+
+        rows.append(make_row(net,net_data[net]["_TOTAL"]))
+
+        for t in sorted(net_data[net].keys()):
+            if t=="_TOTAL": continue
+            rows.append(make_row("   "+t,net_data[net][t]))
+
+        rows.append([""]*len(header))
+
+    return pd.DataFrame(rows)
 
 # =====================================================
-# BARRIERS
+# UI
 # =====================================================
 
-with tabs[3]:
-    neg=df[df.score<=3]
-    rows=[]
-    for t in themes:
-        if t in neg.columns:
-            c=neg[t].sum()
-            if c>0:
-                rows.append([t,c/len(neg)*100])
-    if rows:
-        d=pd.DataFrame(rows,columns=["Theme","Pct"]).sort_values("Pct",ascending=False)
-        st.dataframe(d)
-        st.bar_chart(d.set_index("Theme"))
+st.title("Monthly Brand Comparison")
 
-# =====================================================
-# TEXT
-# =====================================================
+tab1,tab2=st.tabs(["⭐ Drivers (4-5)","⚠️ Barriers (1-3)"])
 
-with tabs[4]:
-    if "review_text" in df.columns:
-        stop={"the","and","for","this","that"}
-        cnt=Counter()
-        for txt in df["review_text"].dropna():
-            words=re.sub(r"[^a-z ]","",txt.lower()).split()
-            words=[w for w in words if w not in stop and len(w)>2]
-            cnt.update(words)
-        w=pd.DataFrame(cnt.most_common(20),columns=["Word","Count"])
-        st.bar_chart(w.set_index("Word"))
+with tab1:
+    st.dataframe(build_table([4,5]),use_container_width=True)
 
-# =====================================================
-# COHORT
-# =====================================================
-
-with tabs[5]:
-    cohort=df.groupby(["Month","brand_name"]).size().reset_index(name="Reviews")
-    st.plotly_chart(px.line(cohort,x="Month",y="Reviews",color="brand_name"),use_container_width=True)
-
-# =====================================================
-# ANOMALY
-# =====================================================
-
-with tabs[6]:
-    d=df.groupby("Week").size().reset_index(name="Reviews")
-    d["z"]=(d["Reviews"]-d["Reviews"].mean())/d["Reviews"].std()
-    st.plotly_chart(px.line(d,x="Week",y="Reviews"),use_container_width=True)
-    st.dataframe(d[abs(d["z"])>2])
-
-# =====================================================
-# THEME TREND
-# =====================================================
-
-with tabs[7]:
-    if themes:
-        sel=st.selectbox("Theme",themes)
-        rows=[]
-        for m,g in df.groupby("Month"):
-            rows.append([m,g[sel].sum()/len(g)*100 if sel in g else 0])
-        td=pd.DataFrame(rows,columns=["Month","Pct"])
-        st.plotly_chart(px.line(td,x="Month",y="Pct"),use_container_width=True)
-
-# =====================================================
-# COMPARE
-# =====================================================
-
-with tabs[8]:
-    b1=st.selectbox("Brand A",sel_brands)
-    b2=st.selectbox("Brand B",[b for b in sel_brands if b!=b1])
-    if b1 and b2:
-        comp=df[df.brand_name.isin([b1,b2])].groupby("brand_name")["score"].agg(["mean","count"])
-        st.dataframe(comp)
-
-# =====================================================
-# EXEC SUMMARY
-# =====================================================
-
-with tabs[9]:
-    best=df.groupby("brand_name")["score"].mean().idxmax()
-    worst=df.groupby("brand_name")["score"].mean().idxmin()
-
-    st.success(f"Best performing → {best}")
-    st.error(f"Needs attention → {worst}")
-
-    if themes:
-        impact=[(t,df[t].sum()) for t in themes]
-        worst_theme=sorted(impact,key=lambda x:x[1],reverse=True)[0][0]
-        st.warning(f"Top complaint driver → {worst_theme}")
+with tab2:
+    st.dataframe(build_table([1,2,3]),use_container_width=True)
