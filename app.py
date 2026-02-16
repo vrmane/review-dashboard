@@ -1,13 +1,10 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import numpy as np
 from google.cloud import bigquery
 from google.oauth2 import service_account
 from datetime import datetime, timedelta
-from collections import Counter
-import re
 
 # ==========================================================
 # PAGE CONFIG
@@ -53,7 +50,7 @@ def init_bq():
 bq = init_bq()
 
 # ==========================================================
-# LOAD DATA FROM BIGQUERY
+# LOAD DATA
 # ==========================================================
 
 @st.cache_data(ttl=900)
@@ -64,7 +61,7 @@ def load_data():
     """
     df = bq.query(query).to_dataframe()
 
-    # ✅ FIX TIMEZONE ISSUE (CRITICAL)
+    # --- FIX DATE ---
     df["date"] = (
         pd.to_datetime(df["date"], utc=True)
         .dt.tz_convert("Asia/Kolkata")
@@ -91,14 +88,14 @@ if df_raw.empty:
     st.stop()
 
 # ==========================================================
-# AUTO DETECT NET COLUMNS (0/1)
+# AUTO DETECT NET COLUMNS
 # ==========================================================
 
 def detect_net_columns(df):
     net_cols = []
     for col in df.columns:
         if df[col].dtype in [np.int64, np.int32, np.int8]:
-            if set(df[col].dropna().unique()).issubset({0, 1}):
+            if set(df[col].dropna().unique()).issubset({0,1}):
                 net_cols.append(col)
     return net_cols
 
@@ -112,7 +109,9 @@ with st.sidebar:
     st.title("🎛️ Command Center")
     st.success(f"🟢 Live Rows: {len(df_raw):,}")
 
-    min_d, max_d = df_raw["date"].min().date(), df_raw["date"].max().date()
+    min_d = df_raw["date"].min().date()
+    max_d = df_raw["date"].max().date()
+
     date_range = st.date_input(
         "Period",
         [min_d, max_d],
@@ -126,11 +125,10 @@ with st.sidebar:
     ratings = st.multiselect("Ratings", [1,2,3,4,5], default=[1,2,3,4,5])
 
 # ==========================================================
-# APPLY FILTERS (FIXED VERSION)
+# APPLY FILTERS
 # ==========================================================
 
 df = df_raw.copy()
-
 mask = pd.Series(True, index=df.index)
 
 if len(date_range) == 2:
@@ -144,7 +142,7 @@ mask &= df["rating"].isin(ratings)
 df = df[mask]
 
 # ==========================================================
-# DASHBOARD
+# DASHBOARD HEADER
 # ==========================================================
 
 st.title("🦅 Strategic Intelligence Platform")
@@ -156,8 +154,10 @@ st.markdown("---")
 
 col1, col2, col3, col4 = st.columns(4)
 
+total = len(df)
+
 with col1:
-    st.metric("Total Reviews", f"{len(df):,}")
+    st.metric("Total Reviews", f"{total:,}")
 
 with col2:
     st.metric("Avg Rating", f"{df['rating'].mean():.2f} ⭐")
@@ -165,7 +165,6 @@ with col2:
 with col3:
     promoters = len(df[df["rating"] == 5])
     detractors = len(df[df["rating"] <= 3])
-    total = len(df)
     nps = ((promoters - detractors) / total * 100) if total else 0
     st.metric("NPS Proxy", f"{nps:.0f}")
 
@@ -217,42 +216,6 @@ fig_sent.update_layout(template="plotly_dark")
 st.plotly_chart(fig_sent, use_container_width=True)
 
 # ==========================================================
-# TOP THEMES (NET)
-# ==========================================================
-
-st.subheader("🚀 Top Themes (Overall)")
-
-if theme_cols:
-    theme_counts = (
-        df[theme_cols]
-        .sum()
-        .sort_values(ascending=False)
-        .head(15)
-    )
-
-    theme_df = pd.DataFrame({
-        "Theme": theme_counts.index,
-        "Count": theme_counts.values
-    })
-
-    fig_theme = px.bar(
-        theme_df,
-        x="Count",
-        y="Theme",
-        orientation="h"
-    )
-
-    fig_theme.update_layout(
-        template="plotly_dark",
-        yaxis={"categoryorder":"total ascending"}
-    )
-
-    st.plotly_chart(fig_theme, use_container_width=True)
-
-else:
-    st.info("No NET columns detected.")
-
-# ==========================================================
 # MONTHLY TREND
 # ==========================================================
 
@@ -274,3 +237,152 @@ fig_trend = px.line(
 
 fig_trend.update_layout(template="plotly_dark")
 st.plotly_chart(fig_trend, use_container_width=True)
+
+# ==========================================================
+# DRIVERS & BARRIERS
+# ==========================================================
+
+st.markdown("---")
+st.header("🚀 Drivers & 🛑 Barriers")
+
+if theme_cols:
+
+    drivers_df = df[df["rating"] >= 4]
+    barriers_df = df[df["rating"] <= 3]
+
+    col_d, col_b = st.columns(2)
+
+    with col_d:
+        st.subheader("🚀 Top Drivers")
+
+        if not drivers_df.empty:
+            base = len(drivers_df)
+            counts = drivers_df[theme_cols].sum().sort_values(ascending=False).head(10)
+            pct = (counts / base * 100).round(1)
+
+            plot_df = pd.DataFrame({"Theme": counts.index, "Pct": pct.values})
+
+            fig = px.bar(
+                plot_df,
+                x="Pct",
+                y="Theme",
+                orientation="h",
+                text="Pct",
+                color_discrete_sequence=["#10b981"]
+            )
+
+            fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+            fig.update_layout(template="plotly_dark", yaxis={"categoryorder":"total ascending"})
+            st.plotly_chart(fig, use_container_width=True)
+
+    with col_b:
+        st.subheader("🛑 Top Barriers")
+
+        if not barriers_df.empty:
+            base = len(barriers_df)
+            counts = barriers_df[theme_cols].sum().sort_values(ascending=False).head(10)
+            pct = (counts / base * 100).round(1)
+
+            plot_df = pd.DataFrame({"Theme": counts.index, "Pct": pct.values})
+
+            fig = px.bar(
+                plot_df,
+                x="Pct",
+                y="Theme",
+                orientation="h",
+                text="Pct",
+                color_discrete_sequence=["#ef4444"]
+            )
+
+            fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+            fig.update_layout(template="plotly_dark", yaxis={"categoryorder":"total ascending"})
+            st.plotly_chart(fig, use_container_width=True)
+
+# ==========================================================
+# IMPACT MATRIX
+# ==========================================================
+
+st.markdown("---")
+st.subheader("🎯 Strategic Impact Matrix")
+
+impact_data = []
+total_reviews = len(df)
+
+for theme in theme_cols:
+    theme_count = df[theme].sum()
+    if theme_count > 0:
+        avg_rating = df[df[theme] == 1]["rating"].mean()
+        freq_pct = (theme_count / total_reviews) * 100
+
+        impact_data.append({
+            "Theme": theme,
+            "Frequency (%)": freq_pct,
+            "Avg Rating": avg_rating
+        })
+
+if impact_data:
+
+    impact_df = pd.DataFrame(impact_data).sort_values(
+        "Frequency (%)",
+        ascending=False
+    ).head(20)
+
+    fig_impact = px.scatter(
+        impact_df,
+        x="Frequency (%)",
+        y="Avg Rating",
+        text="Theme",
+        size="Frequency (%)",
+        color="Avg Rating",
+        color_continuous_scale="RdYlGn"
+    )
+
+    fig_impact.update_traces(textposition="top center")
+    fig_impact.update_layout(template="plotly_dark")
+    st.plotly_chart(fig_impact, use_container_width=True)
+
+# ==========================================================
+# BRAND DRIVER MATRIX
+# ==========================================================
+
+st.markdown("---")
+st.subheader("🏢 Brand Driver Matrix (%)")
+
+if theme_cols and not drivers_df.empty:
+
+    base_counts = drivers_df.groupby("brand_name").size()
+
+    top_themes = (
+        drivers_df[theme_cols]
+        .sum()
+        .sort_values(ascending=False)
+        .head(8)
+        .index
+    )
+
+    matrix_data = []
+    matrix_data.append(base_counts.to_dict())
+
+    for theme in top_themes:
+        row = {}
+        for brand in sel_brands:
+            brand_df = drivers_df[drivers_df["brand_name"] == brand]
+            base = len(brand_df)
+            if base > 0:
+                row[brand] = round((brand_df[theme].sum() / base) * 100, 1)
+            else:
+                row[brand] = 0
+        matrix_data.append(row)
+
+    matrix_df = pd.DataFrame(
+        matrix_data,
+        index=["Base (N)"] + list(top_themes)
+    )
+
+    st.dataframe(
+        matrix_df.style
+        .format("{:.1f}", subset=pd.IndexSlice[top_themes, :])
+        .format("{:.0f}", subset=pd.IndexSlice[["Base (N)"], :])
+        .background_gradient(cmap="Greens", axis=None),
+        use_container_width=True
+    )
