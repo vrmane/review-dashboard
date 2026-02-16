@@ -4,3 +4,4 @@ plotly
 google-cloud-bigquery
 db-dtypes
 pyarrow
+google-auth
