@@ -15,18 +15,29 @@ st.set_page_config(layout="wide")
 st.title("📊 App Review Dashboard")
 
 # =====================================================
-# LOAD DATA
+# FAST DATA LOAD (Optimized)
 # =====================================================
 
 @st.cache_data(ttl=600)
-def load_data():
+def load_data(limit=50000):
+
     client = bigquery.Client()
+
     query = f"""
-        SELECT *
+        SELECT
+            review_id,
+            brand_name,
+            rating,
+            sentiment,
+            themes,
+            date
         FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
+        WHERE DATE(date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+        ORDER BY date DESC
+        LIMIT {limit}
     """
-    df = client.query(query).to_dataframe()
-    return df
+
+    return client.query(query).to_dataframe()
 
 df = load_data()
 
@@ -35,23 +46,19 @@ if df.empty:
     st.stop()
 
 # =====================================================
-# DATA CLEANING (IMPORTANT)
+# DATA CLEANING
 # =====================================================
 
 df = df.copy()
-
-# Replace pd.NA to avoid plotly crash
 df = df.replace({pd.NA: None})
 
-# Ensure date column
 if "date" in df.columns:
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["Month"] = df["date"].dt.to_period("M").astype(str)
 
-# Normalize sentiment column
 if "sentiment" in df.columns:
     df["Sentiment_Label"] = df["sentiment"].fillna("Neutral")
-elif "Sentiment_Label" not in df.columns:
+else:
     df["Sentiment_Label"] = "Neutral"
 
 # =====================================================
@@ -119,7 +126,7 @@ with tabs[1]:
         )
 
     else:
-        st.info("Month or rating column missing.")
+        st.info("Required columns missing.")
 
 # =====================================================
 # BRANDS
@@ -166,8 +173,8 @@ with tabs[3]:
         st.info("No themes column available.")
     else:
 
-        # explode themes list safely
         theme_df = df.copy()
+
         theme_df["themes"] = theme_df["themes"].apply(
             lambda x: x if isinstance(x, list) else []
         )
@@ -185,10 +192,11 @@ with tabs[3]:
         th = th.rename(columns={"themes": "Theme"})
         th = th.fillna(0)
 
-        st.dataframe(th.sort_values("Reviews", ascending=False),
-                     use_container_width=True)
+        st.dataframe(
+            th.sort_values("Reviews", ascending=False),
+            use_container_width=True
+        )
 
-        # Drop NA numeric rows
         th = th.dropna(subset=["Reviews", "Negative"])
 
         fig_scatter = px.scatter(
