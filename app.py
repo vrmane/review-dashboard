@@ -12,14 +12,14 @@ DATASET_ID = "app_reviews_ds"
 TABLE_ID = "raw_reviews"
 
 st.set_page_config(layout="wide")
-st.title("📊 App Review Dashboard")
+st.title("📊 App Review Intelligence Dashboard")
 
 # =====================================================
-# FAST DATA LOAD (Optimized)
+# DATA LOAD
 # =====================================================
 
 @st.cache_data(ttl=600)
-def load_data(limit=50000):
+def load_data(days=120, limit=150000):
 
     client = bigquery.Client()
 
@@ -32,12 +32,14 @@ def load_data(limit=50000):
             themes,
             date
         FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
-        WHERE DATE(date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+        WHERE DATE(date) >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
         ORDER BY date DESC
         LIMIT {limit}
     """
 
-    return client.query(query).to_dataframe()
+    df = client.query(query).to_dataframe()
+    return df
+
 
 df = load_data()
 
@@ -46,26 +48,81 @@ if df.empty:
     st.stop()
 
 # =====================================================
-# DATA CLEANING
+# CLEANING
 # =====================================================
 
 df = df.copy()
 df = df.replace({pd.NA: None})
 
-if "date" in df.columns:
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["Month"] = df["date"].dt.to_period("M").astype(str)
+df["date"] = pd.to_datetime(df["date"], errors="coerce")
+df["Month"] = df["date"].dt.to_period("M").astype(str)
 
-if "sentiment" in df.columns:
-    df["Sentiment_Label"] = df["sentiment"].fillna("Neutral")
-else:
-    df["Sentiment_Label"] = "Neutral"
+df["Sentiment_Label"] = df["sentiment"].fillna("Neutral")
+
+df["Rating_Bucket"] = pd.cut(
+    df["rating"],
+    bins=[0,2,3,4,5],
+    labels=["1-2","3","4","5"]
+)
+
+# =====================================================
+# SIDEBAR FILTERS
+# =====================================================
+
+st.sidebar.header("Filters")
+
+brand_filter = st.sidebar.multiselect(
+    "Brand",
+    sorted(df["brand_name"].dropna().unique())
+)
+
+sentiment_filter = st.sidebar.multiselect(
+    "Sentiment",
+    sorted(df["Sentiment_Label"].unique())
+)
+
+rating_filter = st.sidebar.multiselect(
+    "Rating Bucket",
+    sorted(df["Rating_Bucket"].dropna().unique())
+)
+
+date_range = st.sidebar.date_input(
+    "Date Range",
+    [df["date"].min(), df["date"].max()]
+)
+
+# APPLY FILTERS
+
+mask = pd.Series(True, index=df.index)
+
+if brand_filter:
+    mask &= df["brand_name"].isin(brand_filter)
+
+if sentiment_filter:
+    mask &= df["Sentiment_Label"].isin(sentiment_filter)
+
+if rating_filter:
+    mask &= df["Rating_Bucket"].isin(rating_filter)
+
+if len(date_range) == 2:
+    mask &= df["date"].between(
+        pd.to_datetime(date_range[0]),
+        pd.to_datetime(date_range[1])
+    )
+
+df = df[mask]
 
 # =====================================================
 # TABS
 # =====================================================
 
-tabs = st.tabs(["Overview", "Trends", "Brands", "Themes"])
+tabs = st.tabs([
+    "Overview",
+    "Trends",
+    "Brand Intelligence",
+    "Theme Intelligence",
+    "Deep Dive Table"
+])
 
 # =====================================================
 # OVERVIEW
@@ -74,15 +131,27 @@ tabs = st.tabs(["Overview", "Trends", "Brands", "Themes"])
 with tabs[0]:
 
     total_reviews = len(df)
-    avg_rating = round(df["rating"].mean(), 2) if "rating" in df.columns else 0
-    negative_pct = round(
-        (df["Sentiment_Label"] == "Negative").mean() * 100, 2
-    )
+    avg_rating = round(df["rating"].mean(),2)
+    neg_pct = (df["Sentiment_Label"]=="Negative").mean()*100
+    pos_pct = (df["Sentiment_Label"]=="Positive").mean()*100
 
-    col1, col2, col3 = st.columns(3)
+    col1,col2,col3,col4 = st.columns(4)
+
     col1.metric("Total Reviews", total_reviews)
-    col2.metric("Average Rating", avg_rating)
-    col3.metric("Negative %", f"{negative_pct}%")
+    col2.metric("Avg Rating", avg_rating)
+    col3.metric("Positive %", f"{pos_pct:.1f}%")
+    col4.metric("Negative %", f"{neg_pct:.1f}%")
+
+    st.divider()
+
+    st.subheader("Sentiment Distribution")
+
+    fig = px.histogram(
+        df,
+        x="Sentiment_Label",
+        color="Sentiment_Label"
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
 # TRENDS
@@ -90,127 +159,159 @@ with tabs[0]:
 
 with tabs[1]:
 
-    if "Month" in df.columns and "rating" in df.columns:
+    monthly = df.groupby("Month").agg(
+        Reviews=("review_id","count"),
+        Rating=("rating","mean"),
+        Negative=("Sentiment_Label",
+                  lambda x:(x=="Negative").mean()*100)
+    ).reset_index()
 
-        monthly = df.groupby("Month").agg(
-            Reviews=("review_id", "count"),
-            Rating=("rating", "mean")
-        ).reset_index()
+    st.subheader("Review Trend")
 
-        monthly = monthly.fillna(0)
+    st.plotly_chart(
+        px.line(monthly,x="Month",y="Reviews"),
+        use_container_width=True
+    )
 
-        fig_reviews = px.line(
-            monthly,
-            x="Month",
-            y="Reviews",
-            title="Monthly Reviews"
-        )
+    st.subheader("Rating Trend")
 
-        st.plotly_chart(
-            fig_reviews,
-            use_container_width=True,
-            key="monthly_reviews_chart"
-        )
+    st.plotly_chart(
+        px.line(monthly,x="Month",y="Rating"),
+        use_container_width=True
+    )
 
-        fig_rating = px.line(
-            monthly,
-            x="Month",
-            y="Rating",
-            title="Monthly Average Rating"
-        )
+    st.subheader("Negative Trend")
 
-        st.plotly_chart(
-            fig_rating,
-            use_container_width=True,
-            key="monthly_rating_chart"
-        )
-
-    else:
-        st.info("Required columns missing.")
+    st.plotly_chart(
+        px.line(monthly,x="Month",y="Negative"),
+        use_container_width=True
+    )
 
 # =====================================================
-# BRANDS
+# BRAND INTELLIGENCE
 # =====================================================
 
 with tabs[2]:
 
-    if "brand_name" not in df.columns:
-        st.info("No brand column found.")
-    else:
+    brand = df.groupby("brand_name").agg(
+        Reviews=("review_id","count"),
+        Rating=("rating","mean"),
+        Negative=("Sentiment_Label",
+                  lambda x:(x=="Negative").mean()*100)
+    ).reset_index().sort_values("Reviews",ascending=False)
 
-        brand = df.groupby("brand_name").agg(
-            Reviews=("review_id", "count"),
-            Rating=("rating", "mean"),
-            Negative=("Sentiment_Label",
-                      lambda x: (x == "Negative").mean() * 100)
-        ).reset_index()
+    st.dataframe(brand,use_container_width=True)
 
-        brand = brand.sort_values("Reviews", ascending=False)
-        brand = brand.fillna(0)
+    st.subheader("Review Volume")
 
-        st.dataframe(brand, use_container_width=True)
+    st.plotly_chart(
+        px.bar(brand,x="brand_name",y="Reviews"),
+        use_container_width=True
+    )
 
-        fig_brand_reviews = px.bar(
+    st.subheader("Brand Perception Map")
+
+    st.plotly_chart(
+        px.scatter(
             brand,
-            x="brand_name",
-            y="Reviews",
-            title="Reviews by Brand"
-        )
-
-        st.plotly_chart(
-            fig_brand_reviews,
-            use_container_width=True,
-            key="brand_reviews_chart"
-        )
+            x="Reviews",
+            y="Negative",
+            size="Reviews",
+            hover_name="brand_name"
+        ),
+        use_container_width=True
+    )
 
 # =====================================================
-# THEMES
+# THEME INTELLIGENCE
 # =====================================================
 
 with tabs[3]:
 
-    if "themes" not in df.columns:
-        st.info("No themes column available.")
-    else:
+    theme_df = df.copy()
 
-        theme_df = df.copy()
+    theme_df["themes"] = theme_df["themes"].apply(
+        lambda x: x if isinstance(x,list) else []
+    )
 
-        theme_df["themes"] = theme_df["themes"].apply(
-            lambda x: x if isinstance(x, list) else []
-        )
+    theme_df = theme_df.explode("themes")
+    theme_df["themes"] = theme_df["themes"].fillna("Unknown")
 
-        theme_df = theme_df.explode("themes")
+    th = theme_df.groupby("themes").agg(
+        Reviews=("review_id","count"),
+        Negative=("Sentiment_Label",
+                  lambda x:(x=="Negative").mean()*100),
+        Rating=("rating","mean")
+    ).reset_index()
 
-        theme_df["themes"] = theme_df["themes"].fillna("Unknown")
+    th["Impact_Score"] = th["Reviews"] * th["Negative"]
 
-        th = theme_df.groupby("themes").agg(
-            Reviews=("review_id", "count"),
-            Negative=("Sentiment_Label",
-                      lambda x: (x == "Negative").mean() * 100)
-        ).reset_index()
+    st.dataframe(
+        th.sort_values("Impact_Score",ascending=False),
+        use_container_width=True
+    )
 
-        th = th.rename(columns={"themes": "Theme"})
-        th = th.fillna(0)
+    st.subheader("Top Complaint Drivers")
 
-        st.dataframe(
-            th.sort_values("Reviews", ascending=False),
-            use_container_width=True
-        )
+    st.plotly_chart(
+        px.bar(
+            th.sort_values("Impact_Score",ascending=False).head(15),
+            x="themes",
+            y="Impact_Score"
+        ),
+        use_container_width=True
+    )
 
-        th = th.dropna(subset=["Reviews", "Negative"])
+    st.subheader("Theme Performance Matrix")
 
-        fig_scatter = px.scatter(
+    st.plotly_chart(
+        px.scatter(
             th,
             x="Reviews",
             y="Negative",
-            size="Reviews",
-            color="Negative",
-            hover_name="Theme",
-            title="Theme Performance (Volume vs Negative %)"
-        )
+            size="Impact_Score",
+            hover_name="themes"
+        ),
+        use_container_width=True
+    )
 
-        st.plotly_chart(
-            fig_scatter,
-            use_container_width=True,
-            key="theme_scatter_chart"
-        )
+# =====================================================
+# RAW DATA TABLE
+# =====================================================
+
+with tabs[4]:
+
+    st.dataframe(df,use_container_width=True)
+
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download Filtered Data",
+        csv,
+        "filtered_reviews.csv",
+        "text/csv"
+    )
+
+# =====================================================
+# AUTO INSIGHTS
+# =====================================================
+
+st.divider()
+st.subheader("Automated Insights")
+
+if not df.empty:
+
+    worst_theme = th.sort_values("Impact_Score",ascending=False).iloc[0]
+    best_brand = brand.sort_values("Rating",ascending=False).iloc[0]
+    worst_brand = brand.sort_values("Negative",ascending=False).iloc[0]
+
+    st.info(f"""
+    • Biggest pain point: **{worst_theme.themes}**
+    appears in **{int(worst_theme.Reviews)} reviews**
+    with **{worst_theme.Negative:.1f}% negative sentiment**
+
+    • Best performing brand: **{best_brand.brand_name}**
+    with avg rating **{best_brand.Rating:.2f}**
+
+    • Brand needing attention: **{worst_brand.brand_name}**
+    showing **{worst_brand.Negative:.1f}% negative sentiment**
+    """)
