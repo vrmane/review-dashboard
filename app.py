@@ -1,168 +1,161 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
 # =====================================================
-# CONFIG
+# PAGE CONFIG
 # =====================================================
+st.set_page_config(layout="wide", page_title="Monthly Brand Comparison")
 
-PROJECT="app-review-analyzer-487309"
-DATASET="app_reviews_ds"
-TABLE="raw_reviews"
-
-st.set_page_config(layout="wide")
+st.title("📊 Monthly Brand Comparison")
 
 # =====================================================
-# BQ CLIENT
+# BIGQUERY CONNECTION
 # =====================================================
-
 @st.cache_resource
-def client():
-    key="gcp_service_account" if "gcp_service_account" in st.secrets else "GCP_SERVICE_ACCOUNT"
-    creds=service_account.Credentials.from_service_account_info(dict(st.secrets[key]))
-    return bigquery.Client(credentials=creds,project=creds.project_id)
+def get_client():
+    creds = service_account.Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"]
+    )
+    return bigquery.Client(credentials=creds)
 
 # =====================================================
 # LOAD DATA
 # =====================================================
-
 @st.cache_data(ttl=600)
-def load():
+def load_data():
+    client = get_client()
 
-    q=f"""
-    SELECT *
-    FROM `{PROJECT}.{DATASET}.{TABLE}`
-    WHERE DATE(date)>=DATE_SUB(CURRENT_DATE(),INTERVAL 365 DAY)
+    query = """
+        SELECT *
+        FROM `app-review-analyzer-487309.app_reviews_ds.raw_reviews`
+        WHERE DATE(date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 6 MONTH)
     """
 
-    df=client().query(q).to_dataframe()
+    df = client.query(query).to_dataframe()
 
-    df["rating"]=pd.to_numeric(df["rating"],errors="coerce")
-    df["date"]=pd.to_datetime(df["date"],errors="coerce")
-    df=df.dropna(subset=["date"])
+    # ---------- STANDARDIZE COLUMN NAMES ----------
+    cols = {c.lower(): c for c in df.columns}
 
-    df["Month"]=df["date"].dt.to_period("M").astype(str)
+    def find(name_options):
+        for n in name_options:
+            if n.lower() in cols:
+                return cols[n.lower()]
+        return None
 
-    return df
+    col_brand = find(["brand_name","app_name","brand"])
+    col_date = find(["date","review_date"])
+    col_rating = find(["rating","score"])
 
-df=load()
+    if not col_brand or not col_date or not col_rating:
+        st.error("Required columns missing in table.")
+        st.stop()
+
+    df = df.rename(columns={
+        col_brand: "Brand",
+        col_date: "Date",
+        col_rating: "Rating"
+    })
+
+    # ---------- DATE PARSE ----------
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True)
+    df = df.dropna(subset=["Date"])
+
+    df["Month"] = df["Date"].dt.to_period("M").astype(str)
+
+    # ---------- FIND THEME COLUMNS ----------
+    non_theme = {"Brand","Date","Rating","Month","review_id","content","sentiment","products","themes","app_id"}
+    theme_cols = [c for c in df.columns if c not in non_theme and df[c].dropna().isin([0,1]).all()]
+
+    return df, theme_cols
+
+
+df, theme_cols = load_data()
+
+if df.empty:
+    st.warning("No data found.")
+    st.stop()
 
 # =====================================================
 # HELPERS
 # =====================================================
-
-def normalize_brand(x):
-    s=str(x).lower()
-    if "moneyview" in s: return "MoneyView"
-    if "kreditbee" in s: return "KreditBee"
-    if "navi" in s: return "Navi"
-    if "kissht" in s: return "Kissht"
-    return None
-
-def is_pl(row):
-    for c in ["Product_1","Product_2","Product_3","Product_4"]:
-        if c in row and pd.notna(row[c]):
-            v=str(row[c]).lower()
-            if "loan" in v or "pl" in v or "personal" in v:
-                return True
-    return False
-
-theme_cols=[c for c in df.columns if str(c).startswith("Theme_")]
-
-# =====================================================
-# CORE BUILDER
-# =====================================================
-
 def build_table(ratings):
 
-    d=df[df["rating"].isin(ratings)].copy()
+    d = df[df["Rating"].isin(ratings)].copy()
+    if d.empty:
+        return pd.DataFrame()
 
-    d["Brand"]=d["App_Name"].apply(normalize_brand)
-    d=d.dropna(subset=["Brand"])
+    brands = sorted(d["Brand"].dropna().unique())
+    months = sorted(d["Month"].unique())[-6:]
 
-    d=d[d.apply(is_pl,axis=1)]
+    # ---------- BASE ----------
+    base = d.groupby(["Brand","Month"]).size().unstack(fill_value=0)
 
-    months=sorted(d["Month"].unique())[-6:]
-    brands=sorted(d["Brand"].unique(),key=lambda x:(x!="MoneyView",x))
+    # ---------- THEME COUNTS ----------
+    records = []
 
-    # base
-    base=d.groupby(["Brand","Month"]).size().unstack(fill_value=0)
+    for theme in theme_cols:
 
-    net_data={}
+        temp = d[d[theme]==1]
+        if temp.empty:
+            continue
 
-    for _,r in d.iterrows():
+        counts = temp.groupby(["Brand","Month"]).size().unstack(fill_value=0)
 
-        nets=set()
-        themes=set()
+        row = {"Theme":theme}
 
-        for c in theme_cols:
-            if pd.notna(r[c]) and r[c]!="":
-                net=r[c]
-                nets.add(net)
-                themes.add((net,str(r[c]).title()))
+        for m in months:
+            for b in brands:
+                b_base = base.get(m, pd.Series()).get(b,0) if m in base.columns else 0
+                val = counts.get(m, pd.Series()).get(b,0) if m in counts.columns else 0
+                row[f"{m}|{b}"] = val/b_base if b_base else 0
 
-        for net in nets:
-            net_data.setdefault(net,{}).setdefault("_TOTAL",{}).setdefault(r["Brand"],{}).setdefault(r["Month"],0)
-            net_data[net]["_TOTAL"][r["Brand"]][r["Month"]]+=1
+        records.append(row)
 
-        for net,theme in themes:
-            net_data.setdefault(net,{}).setdefault(theme,{}).setdefault(r["Brand"],{}).setdefault(r["Month"],0)
-            net_data[net][theme][r["Brand"]][r["Month"]]+=1
+    if not records:
+        return pd.DataFrame()
 
-    # sort nets by latest MV %
-    latest=months[-1] if months else None
+    out = pd.DataFrame(records).set_index("Theme")
+    return out.sort_index()
 
-    def mv_pct(obj):
-        b=base.get(latest,{}).get("MoneyView",0) if latest in base.columns else 0
-        v=obj.get("MoneyView",{}).get(latest,0)
-        return v/b if b else 0
-
-    sorted_nets=sorted(net_data.keys(),key=lambda n:mv_pct(net_data[n]["_TOTAL"]),reverse=True)
-
-    # build table
-    rows=[]
-
-    header=["NET"]+[f"{m}-{b}" for m in months for b in brands]
-    rows.append(header)
-
-    base_row=["BASE"]
-    for m in months:
-        for b in brands:
-            base_row.append(base.get(m,{}).get(b,0))
-    rows.append(base_row)
-
-    for net in sorted_nets:
-
-        def make_row(label,obj):
-            r=[label]
-            for m in months:
-                for b in brands:
-                    bcount=base.get(m,{}).get(b,0)
-                    v=obj.get(b,{}).get(m,0)
-                    r.append(v/bcount if bcount else 0)
-            return r
-
-        rows.append(make_row(net,net_data[net]["_TOTAL"]))
-
-        for t in sorted(net_data[net].keys()):
-            if t=="_TOTAL": continue
-            rows.append(make_row("   "+t,net_data[net][t]))
-
-        rows.append([""]*len(header))
-
-    return pd.DataFrame(rows)
 
 # =====================================================
-# UI
+# TABS
 # =====================================================
+tab1, tab2 = st.tabs(["⭐ Drivers (4-5★)", "⚠️ Barriers (1-3★)"])
 
-st.title("Monthly Brand Comparison")
-
-tab1,tab2=st.tabs(["⭐ Drivers (4-5)","⚠️ Barriers (1-3)"])
-
+# =====================================================
+# DRIVERS
+# =====================================================
 with tab1:
-    st.dataframe(build_table([4,5]),use_container_width=True)
 
+    st.subheader("Monthly Drivers Comparison")
+
+    tbl = build_table([4,5])
+
+    if tbl.empty:
+        st.info("No driver data.")
+    else:
+        st.dataframe(
+            tbl.style.format("{:.0%}"),
+            use_container_width=True
+        )
+
+# =====================================================
+# BARRIERS
+# =====================================================
 with tab2:
-    st.dataframe(build_table([1,2,3]),use_container_width=True)
+
+    st.subheader("Monthly Barriers Comparison")
+
+    tbl = build_table([1,2,3])
+
+    if tbl.empty:
+        st.info("No barrier data.")
+    else:
+        st.dataframe(
+            tbl.style.format("{:.0%}"),
+            use_container_width=True
+        )
