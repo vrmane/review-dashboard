@@ -1,36 +1,18 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.express as px
 from google.cloud import bigquery
-from google.oauth2 import service_account
-from datetime import timedelta
 
 # =====================================================
-# PAGE CONFIG
+# CONFIG
 # =====================================================
 
-st.set_page_config(
-    page_title="Strategic Intelligence Platform",
-    page_icon="📊",
-    layout="wide"
-)
+PROJECT_ID = "app-review-analyzer-487309"
+DATASET_ID = "app_reviews_ds"
+TABLE_ID = "raw_reviews"
 
-# =====================================================
-# BIGQUERY CONNECTION
-# =====================================================
-
-@st.cache_resource
-def init_bq():
-    credentials = service_account.Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"]
-    )
-    return bigquery.Client(
-        credentials=credentials,
-        project=credentials.project_id
-    )
-
-bq = init_bq()
+st.set_page_config(layout="wide")
+st.title("📊 App Review Dashboard")
 
 # =====================================================
 # LOAD DATA
@@ -38,166 +20,45 @@ bq = init_bq()
 
 @st.cache_data(ttl=600)
 def load_data():
-
-    query = """
-    SELECT *
-    FROM `app-review-analyzer-487309.app_reviews_ds.raw_reviews`
+    client = bigquery.Client()
+    query = f"""
+        SELECT *
+        FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
     """
-
-    df = bq.query(query).to_dataframe()
-
-    # ---------- SAFETY COLUMN STANDARDIZATION ----------
-    df.columns = [c.strip() for c in df.columns]
-
-    # ---------- DATE ----------
-    if "date" in df.columns:
-        df["date"] = (
-            pd.to_datetime(df["date"], errors="coerce", utc=True)
-            .dt.tz_convert("Asia/Kolkata")
-            .dt.tz_localize(None)
-        )
-
-        df["Month"] = df["date"].dt.to_period("M").astype(str)
-        df["Week"] = df["date"].dt.to_period("W").astype(str)
-
-    # ---------- RATING ----------
-    if "rating" in df.columns:
-        df["rating"] = pd.to_numeric(df["rating"], errors="coerce")
-
-        df["Sentiment_Label"] = pd.cut(
-            df["rating"],
-            bins=[0,2,3,5],
-            labels=["Negative","Neutral","Positive"]
-        )
-
-    # ---------- PRODUCTS ----------
-    if "products" in df.columns:
-        df["products"] = df["products"].apply(
-            lambda x: x if isinstance(x,list) else []
-        )
-    else:
-        df["products"] = [[] for _ in range(len(df))]
-
+    df = client.query(query).to_dataframe()
     return df
 
-df_raw = load_data()
+df = load_data()
 
-if df_raw.empty:
-    st.error("No data returned from BigQuery.")
+if df.empty:
+    st.warning("No data available.")
     st.stop()
 
 # =====================================================
-# AUTO DETECT THEMES
+# DATA CLEANING (IMPORTANT)
 # =====================================================
 
-def detect_themes(df):
+df = df.copy()
 
-    ignore = {
-        "app_id","brand_name","review_id","date","content",
-        "sentiment","products","themes","rating",
-        "Month","Week","Sentiment_Label"
-    }
+# Replace pd.NA to avoid plotly crash
+df = df.replace({pd.NA: None})
 
-    theme_cols = []
+# Ensure date column
+if "date" in df.columns:
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["Month"] = df["date"].dt.to_period("M").astype(str)
 
-    for col in df.columns:
-
-        if col in ignore:
-            continue
-
-        series = pd.to_numeric(df[col], errors="coerce")
-        vals = set(series.dropna().unique())
-
-        if vals.issubset({0,1}) and len(vals)<=2:
-            theme_cols.append(col)
-
-    return theme_cols
-
-theme_cols = detect_themes(df_raw)
+# Normalize sentiment column
+if "sentiment" in df.columns:
+    df["Sentiment_Label"] = df["sentiment"].fillna("Neutral")
+elif "Sentiment_Label" not in df.columns:
+    df["Sentiment_Label"] = "Neutral"
 
 # =====================================================
-# SIDEBAR FILTERS
+# TABS
 # =====================================================
 
-with st.sidebar:
-
-    st.title("Filters")
-
-    # DATE RANGE
-    if "date" in df_raw.columns:
-
-        min_d = df_raw["date"].min().date()
-        max_d = df_raw["date"].max().date()
-
-        date_range = st.date_input(
-            "Date Range",
-            [min_d,max_d],
-            min_value=min_d,
-            max_value=max_d
-        )
-    else:
-        date_range=None
-
-    # BRAND
-    if "brand_name" in df_raw.columns:
-        brands = sorted(df_raw["brand_name"].dropna().unique())
-        sel_brands = st.multiselect("Brands",brands,brands)
-    else:
-        sel_brands=[]
-
-    # RATING
-    sel_ratings = st.multiselect(
-        "Ratings",
-        [1,2,3,4,5],
-        [1,2,3,4,5]
-    ) or [1,2,3,4,5]
-
-    # PRODUCTS
-    all_products = sorted({p for sub in df_raw["products"] for p in sub})
-    sel_products = st.multiselect("Products",all_products)
-
-# =====================================================
-# APPLY FILTERS
-# =====================================================
-
-df = df_raw.copy()
-mask = pd.Series(True,index=df.index)
-
-# DATE
-if date_range and "date" in df.columns:
-    if len(date_range)==2:
-        start=pd.to_datetime(date_range[0])
-        end=pd.to_datetime(date_range[1])+timedelta(days=1)
-        mask &= (df["date"]>=start)&(df["date"]<end)
-
-# BRAND
-if sel_brands and "brand_name" in df.columns:
-    mask &= df["brand_name"].isin(sel_brands)
-
-# RATING
-if "rating" in df.columns:
-    mask &= df["rating"].isin(sel_ratings)
-
-# PRODUCTS
-if sel_products:
-    mask &= df["products"].apply(lambda x:any(p in x for p in sel_products))
-
-df = df[mask]
-
-# =====================================================
-# NAVIGATION
-# =====================================================
-
-tabs = st.tabs([
-"Overview",
-"Ratings",
-"Trends",
-"Brands",
-"Products",
-"Themes",
-"Risk",
-"Raw Data"
-])
+tabs = st.tabs(["Overview", "Trends", "Brands", "Themes"])
 
 # =====================================================
 # OVERVIEW
@@ -205,198 +66,143 @@ tabs = st.tabs([
 
 with tabs[0]:
 
-    total=len(df)
+    total_reviews = len(df)
+    avg_rating = round(df["rating"].mean(), 2) if "rating" in df.columns else 0
+    negative_pct = round(
+        (df["Sentiment_Label"] == "Negative").mean() * 100, 2
+    )
 
-    avg=df["rating"].mean() if "rating" in df else 0
-    median=df["rating"].median() if "rating" in df else 0
-    std=df["rating"].std() if "rating" in df else 0
-    brands=df["brand_name"].nunique() if "brand_name" in df else 0
-
-    c1,c2,c3,c4,c5=st.columns(5)
-
-    c1.metric("Reviews",f"{total:,}")
-    c2.metric("Avg Rating",f"{avg:.2f}")
-    c3.metric("Median",f"{median:.2f}")
-    c4.metric("Std Dev",f"{std:.2f}")
-    c5.metric("Brands",brands)
-
-    if "Month" in df.columns:
-        trend=df.groupby("Month").size().reset_index(name="Reviews")
-        st.plotly_chart(px.line(trend,x="Month",y="Reviews"),use_container_width=True)
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Reviews", total_reviews)
+    col2.metric("Average Rating", avg_rating)
+    col3.metric("Negative %", f"{negative_pct}%")
 
 # =====================================================
-# RATINGS
+# TRENDS
 # =====================================================
 
 with tabs[1]:
 
-    if "rating" not in df.columns:
-        st.info("No rating column")
-    else:
-
-        dist=df.rating.value_counts().sort_index().reset_index()
-        dist.columns=["Rating","Count"]
-        dist["%"]=dist["Count"]/len(df)*100
-
-        st.plotly_chart(px.bar(dist,x="Rating",y="%"),use_container_width=True)
-
-        if "Sentiment_Label" in df.columns:
-            sent=df.Sentiment_Label.value_counts().reset_index()
-            sent.columns=["Sentiment","Count"]
-
-            st.plotly_chart(px.pie(sent,names="Sentiment",values="Count"),
-                            use_container_width=True)
-
-# =====================================================
-# TRENDS
-# =====================================================
-
-# =====================================================
-# TRENDS
-# =====================================================
-
-with tabs[2]:
-
     if "Month" in df.columns and "rating" in df.columns:
 
         monthly = df.groupby("Month").agg(
-            Reviews=("review_id","count"),
-            Rating=("rating","mean")
+            Reviews=("review_id", "count"),
+            Rating=("rating", "mean")
         ).reset_index()
 
-        fig_reviews = px.line(monthly, x="Month", y="Reviews")
+        monthly = monthly.fillna(0)
+
+        fig_reviews = px.line(
+            monthly,
+            x="Month",
+            y="Reviews",
+            title="Monthly Reviews"
+        )
+
         st.plotly_chart(
             fig_reviews,
             use_container_width=True,
             key="monthly_reviews_chart"
         )
 
-        fig_rating = px.line(monthly, x="Month", y="Rating")
+        fig_rating = px.line(
+            monthly,
+            x="Month",
+            y="Rating",
+            title="Monthly Average Rating"
+        )
+
         st.plotly_chart(
             fig_rating,
             use_container_width=True,
             key="monthly_rating_chart"
         )
 
+    else:
+        st.info("Month or rating column missing.")
+
 # =====================================================
 # BRANDS
 # =====================================================
 
-with tabs[3]:
+with tabs[2]:
 
     if "brand_name" not in df.columns:
-        st.info("No brand column")
+        st.info("No brand column found.")
     else:
 
-        brand=df.groupby("brand_name").agg(
-            Reviews=("review_id","count"),
-            Rating=("rating","mean"),
+        brand = df.groupby("brand_name").agg(
+            Reviews=("review_id", "count"),
+            Rating=("rating", "mean"),
             Negative=("Sentiment_Label",
-                      lambda x:(x=="Negative").mean()*100)
-        ).reset_index().sort_values("Reviews",ascending=False)
+                      lambda x: (x == "Negative").mean() * 100)
+        ).reset_index()
 
-        st.dataframe(brand,use_container_width=True)
+        brand = brand.sort_values("Reviews", ascending=False)
+        brand = brand.fillna(0)
 
-# =====================================================
-# PRODUCTS
-# =====================================================
+        st.dataframe(brand, use_container_width=True)
 
-with tabs[4]:
-
-    if df["products"].explode().empty:
-        st.info("No product data")
-    else:
-
-        prod=df.explode("products")
-
-        prod_stats=prod.groupby("products").agg(
-            Reviews=("review_id","count"),
-            Rating=("rating","mean")
-        ).reset_index().sort_values("Reviews",ascending=False)
+        fig_brand_reviews = px.bar(
+            brand,
+            x="brand_name",
+            y="Reviews",
+            title="Reviews by Brand"
+        )
 
         st.plotly_chart(
-            px.bar(prod_stats.head(15),
-                   x="Reviews",y="products",orientation="h"),
-            use_container_width=True
+            fig_brand_reviews,
+            use_container_width=True,
+            key="brand_reviews_chart"
         )
 
 # =====================================================
 # THEMES
 # =====================================================
 
-with tabs[5]:
+with tabs[3]:
 
-    if not theme_cols:
-        st.warning("No theme columns detected.")
+    if "themes" not in df.columns:
+        st.info("No themes column available.")
     else:
 
-        rows=[]
-
-        for t in theme_cols:
-
-            series=pd.to_numeric(df[t],errors="coerce").fillna(0)
-
-            freq=series.mean()*100
-            rating=df.loc[series==1,"rating"].mean()
-
-            rows.append([t,freq,rating])
-
-        th=pd.DataFrame(rows,columns=["Theme","Frequency","Rating"])
-
-        th["Impact"]=th["Frequency"]*(th["Rating"]-df["rating"].mean())
-
-        st.plotly_chart(
-            px.scatter(
-                th,
-                x="Frequency",
-                y="Rating",
-                size="Frequency",
-                color="Impact",
-                hover_name="Theme"
-            ),
-            use_container_width=True
+        # explode themes list safely
+        theme_df = df.copy()
+        theme_df["themes"] = theme_df["themes"].apply(
+            lambda x: x if isinstance(x, list) else []
         )
 
-# =====================================================
-# RISK
-# =====================================================
+        theme_df = theme_df.explode("themes")
 
-with tabs[6]:
+        theme_df["themes"] = theme_df["themes"].fillna("Unknown")
 
-    if "rating" not in df.columns:
-        st.info("No rating column")
-    else:
+        th = theme_df.groupby("themes").agg(
+            Reviews=("review_id", "count"),
+            Negative=("Sentiment_Label",
+                      lambda x: (x == "Negative").mean() * 100)
+        ).reset_index()
 
-        one_star=(df.rating==1).mean()*100
-        neg=(df.rating<=2).mean()*100
+        th = th.rename(columns={"themes": "Theme"})
+        th = th.fillna(0)
 
-        c1,c2=st.columns(2)
-        c1.metric("1★ Risk %",f"{one_star:.1f}%")
-        c2.metric("Negative %",f"{neg:.1f}%")
+        st.dataframe(th.sort_values("Reviews", ascending=False),
+                     use_container_width=True)
 
-        if "Week" in df.columns:
-            neg_trend=df.groupby("Week")["rating"].apply(
-                lambda x:(x<=2).mean()*100
-            ).reset_index()
+        # Drop NA numeric rows
+        th = th.dropna(subset=["Reviews", "Negative"])
 
-            neg_trend.columns=["Week","Negative%"]
+        fig_scatter = px.scatter(
+            th,
+            x="Reviews",
+            y="Negative",
+            size="Reviews",
+            color="Negative",
+            hover_name="Theme",
+            title="Theme Performance (Volume vs Negative %)"
+        )
 
-            st.plotly_chart(
-                px.line(neg_trend,x="Week",y="Negative%"),
-                use_container_width=True
-            )
-
-# =====================================================
-# RAW DATA
-# =====================================================
-
-with tabs[7]:
-
-    st.dataframe(df,use_container_width=True)
-
-    st.download_button(
-        "Download CSV",
-        df.to_csv(index=False),
-        file_name="filtered_reviews.csv"
-    )
-
+        st.plotly_chart(
+            fig_scatter,
+            use_container_width=True,
+            key="theme_scatter_chart"
+        )
