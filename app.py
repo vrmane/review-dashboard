@@ -251,20 +251,32 @@ with tabs[1]:
 # TRENDS
 # =====================================================
 
+# =====================================================
+# TRENDS
+# =====================================================
+
 with tabs[2]:
 
     if "Month" in df.columns and "rating" in df.columns:
 
-        monthly=df.groupby("Month").agg(
+        monthly = df.groupby("Month").agg(
             Reviews=("review_id","count"),
             Rating=("rating","mean")
         ).reset_index()
 
-        st.plotly_chart(px.line(monthly,x="Month",y="Reviews"),
-                        use_container_width=True)
+        fig_reviews = px.line(monthly, x="Month", y="Reviews")
+        st.plotly_chart(
+            fig_reviews,
+            use_container_width=True,
+            key="monthly_reviews_chart"
+        )
 
-        st.plotly_chart(px.line(monthly,x="Month",y="Rating"),
-                        use_container_width=True)
+        fig_rating = px.line(monthly, x="Month", y="Rating")
+        st.plotly_chart(
+            fig_rating,
+            use_container_width=True,
+            key="monthly_rating_chart"
+        )
 
 # =====================================================
 # BRANDS
