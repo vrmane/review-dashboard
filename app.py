@@ -1,23 +1,26 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import numpy as np
 from google.cloud import bigquery
 from google.oauth2 import service_account
 from datetime import datetime, timedelta
+import re
 
 # ==========================================================
-# PAGE CONFIG
+# 1. PAGE CONFIG
 # ==========================================================
 
 st.set_page_config(
     page_title="Strategic Intelligence Platform",
     page_icon="🦅",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 # ==========================================================
-# DARK EXECUTIVE CSS
+# 2. EXECUTIVE DARK CSS
 # ==========================================================
 
 st.markdown("""
@@ -30,11 +33,26 @@ div[data-testid="metric-container"] {
     padding: 20px;
 }
 hr { border-color: #334155; }
+
+div[role="radiogroup"] {
+    background-color: #1e293b;
+    padding: 8px;
+    border-radius: 12px;
+    display: flex;
+    justify-content: space-around;
+    margin-bottom: 20px;
+    border: 1px solid #334155;
+}
+div[role="radiogroup"] label[data-checked="true"] {
+    background-color: #38bdf8 !important;
+    color: #0f172a !important;
+    font-weight: bold;
+}
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================================
-# BIGQUERY CONNECTION
+# 3. BIGQUERY CONNECTION
 # ==========================================================
 
 @st.cache_resource
@@ -50,7 +68,7 @@ def init_bq():
 bq = init_bq()
 
 # ==========================================================
-# LOAD DATA
+# 4. LOAD DATA
 # ==========================================================
 
 @st.cache_data(ttl=900)
@@ -61,7 +79,7 @@ def load_data():
     """
     df = bq.query(query).to_dataframe()
 
-    # Fix timezone
+    # Date fix
     df["date"] = (
         pd.to_datetime(df["date"], utc=True)
         .dt.tz_convert("Asia/Kolkata")
@@ -75,11 +93,11 @@ def load_data():
 
     df["Sentiment_Label"] = pd.cut(
         df["rating"],
-        bins=[0, 2, 3, 5],
-        labels=["Negative", "Neutral", "Positive"]
+        bins=[0,2,3,5],
+        labels=["Negative","Neutral","Positive"]
     )
 
-    # Ensure products is list
+    # Ensure products is always list
     if "products" in df.columns:
         df["products"] = df["products"].apply(
             lambda x: x if isinstance(x, list) else []
@@ -94,49 +112,55 @@ if df_raw.empty:
     st.stop()
 
 # ==========================================================
-# ROBUST NET COLUMN DETECTION
+# 5. ROBUST NET DETECTION (LIKE SUPABASE VERSION)
 # ==========================================================
 
 def detect_net_columns(df):
 
-    exclude_cols = [
-        "rating", "review_id", "date",
-        "brand_name", "app_id",
-        "products", "themes"
+    exclude = [
+        "review_id","date","brand_name","app_id",
+        "content","rating","products","themes",
+        "Month","Week","Sentiment_Label"
     ]
 
-    net_cols = []
+    theme_cols = []
 
     for col in df.columns:
 
-        if col in exclude_cols:
+        if col in exclude:
             continue
 
+        col_upper = str(col).upper()
+
+        # Strategy 1: Name contains NET
+        if "NET" in col_upper:
+            theme_cols.append(col)
+            continue
+
+        # Strategy 2: Binary numeric 0/1
         series = pd.to_numeric(df[col], errors="coerce")
-
-        if series.notna().sum() == 0:
-            continue
-
         unique_vals = set(series.dropna().unique())
 
-        # Accept 0 / 1 / 0.0 / 1.0
-        if unique_vals.issubset({0, 1, 0.0, 1.0}):
-            net_cols.append(col)
+        if unique_vals.issubset({0,1,0.0,1.0}) and len(unique_vals) <= 2:
+            theme_cols.append(col)
 
-    return net_cols
+    return theme_cols
 
 theme_cols = detect_net_columns(df_raw)
 
 # ==========================================================
-# SIDEBAR FILTERS
+# 6. SIDEBAR FILTERS
 # ==========================================================
 
 with st.sidebar:
-    st.title("🎛️ Command Center")
-    st.success(f"🟢 Live Rows: {len(df_raw):,}")
 
-    # DATE FILTER
-    min_d, max_d = df_raw["date"].min().date(), df_raw["date"].max().date()
+    st.title("🎛️ Command Center")
+    st.success(f"🟢 Live: {len(df_raw):,} Rows")
+    st.markdown("---")
+
+    min_d = df_raw["date"].min().date()
+    max_d = df_raw["date"].max().date()
+
     date_range = st.date_input(
         "Period",
         [min_d, max_d],
@@ -144,22 +168,20 @@ with st.sidebar:
         max_value=max_d
     )
 
-    # BRAND FILTER
     brands = sorted(df_raw["brand_name"].dropna().unique())
     sel_brands = st.multiselect("Brands", brands, default=brands)
 
-    # PRODUCT FILTER (ARRAY SUPPORT)
+    # PRODUCT FILTER (FIXED)
     all_products = sorted(
-        {p for sublist in df_raw["products"] for p in sublist}
+        {p for sub in df_raw["products"] for p in sub}
     )
 
     sel_products = st.multiselect("Products", all_products)
 
-    # RATING FILTER
-    ratings = st.multiselect("Ratings", [1,2,3,4,5], default=[1,2,3,4,5])
+    sel_ratings = st.multiselect("Ratings",[1,2,3,4,5],[1,2,3,4,5])
 
 # ==========================================================
-# APPLY FILTERS
+# 7. APPLY FILTERS
 # ==========================================================
 
 df = df_raw.copy()
@@ -171,9 +193,8 @@ if len(date_range) == 2:
     mask &= (df["date"] >= start) & (df["date"] < end)
 
 mask &= df["brand_name"].isin(sel_brands)
-mask &= df["rating"].isin(ratings)
+mask &= df["rating"].isin(sel_ratings)
 
-# Product filter logic (ARRAY contains)
 if sel_products:
     mask &= df["products"].apply(
         lambda x: any(p in x for p in sel_products)
@@ -182,91 +203,112 @@ if sel_products:
 df = df[mask]
 
 # ==========================================================
-# DASHBOARD
+# 8. NAVIGATION
 # ==========================================================
 
 st.title("🦅 Strategic Intelligence Platform")
-st.markdown("---")
 
-# ==========================================================
-# KPI SECTION
-# ==========================================================
-
-col1, col2, col3, col4 = st.columns(4)
-
-total = len(df)
-
-with col1:
-    st.metric("Total Reviews", f"{total:,}")
-
-with col2:
-    st.metric("Avg Rating", f"{df['rating'].mean():.2f} ⭐" if total else "0")
-
-with col3:
-    promoters = len(df[df["rating"] == 5])
-    detractors = len(df[df["rating"] <= 3])
-    nps = ((promoters - detractors) / total * 100) if total else 0
-    st.metric("NPS Proxy", f"{nps:.0f}")
-
-with col4:
-    risk = (len(df[df["rating"] == 1]) / total * 100) if total else 0
-    st.metric("1★ Risk %", f"{risk:.1f}%")
+nav = st.radio(
+    "Navigation",
+    ["📊 Boardroom Summary","🚀 Drivers & Barriers"],
+    horizontal=True,
+    label_visibility="collapsed"
+)
 
 st.markdown("---")
 
 # ==========================================================
-# 🚀 DRIVERS & 🛑 BARRIERS
+# TAB 1 — BOARDROOM
 # ==========================================================
 
-st.header("🚀 Drivers & 🛑 Barriers")
+if nav == "📊 Boardroom Summary":
 
-if not theme_cols:
-    st.warning("No NET columns detected.")
-else:
+    total = len(df)
+    avg_rating = df["rating"].mean()
 
-    drivers_df = df[df["rating"] >= 4]
-    barriers_df = df[df["rating"] <= 3]
+    col1,col2,col3,col4 = st.columns(4)
 
-    col_d, col_b = st.columns(2)
+    with col1:
+        st.metric("Total Volume", f"{total:,}")
 
-    with col_d:
-        st.subheader("🚀 Top Drivers")
+    with col2:
+        st.metric("Avg Rating", f"{avg_rating:.2f} ⭐")
 
-        if drivers_df.empty:
-            st.info("No positive reviews.")
-        else:
-            base = len(drivers_df)
-            counts = drivers_df[theme_cols].sum().sort_values(ascending=False).head(10)
-            pct = (counts / base * 100).round(1)
+    with col3:
+        prom = len(df[df["rating"]==5])
+        det = len(df[df["rating"]<=3])
+        nps = ((prom-det)/total*100) if total else 0
+        st.metric("NPS Proxy", f"{nps:.0f}")
 
-            fig = px.bar(
-                x=pct.values,
-                y=pct.index,
-                orientation="h",
-                text=pct.values,
-                color_discrete_sequence=["#10b981"]
+    with col4:
+        risk = (len(df[df["rating"]==1])/total*100) if total else 0
+        st.metric("1★ Risk %", f"{risk:.1f}%")
+
+# ==========================================================
+# TAB 2 — DRIVERS & BARRIERS
+# ==========================================================
+
+elif nav == "🚀 Drivers & Barriers":
+
+    st.markdown("### 🎯 Strategic Impact Matrix")
+
+    if not theme_cols:
+        st.warning("No NET columns detected.")
+    else:
+
+        # IMPACT MATRIX
+        stats = []
+        total_reviews = len(df)
+
+        for t in theme_cols:
+            count = df[t].sum()
+            if count > 0:
+                avg = df[df[t]==1]["rating"].mean()
+                stats.append({
+                    "Theme":t,
+                    "Frequency (%)":count/total_reviews*100,
+                    "Avg Rating When Present":avg
+                })
+
+        impact_df = pd.DataFrame(stats)
+
+        if not impact_df.empty:
+            fig = px.scatter(
+                impact_df,
+                x="Frequency (%)",
+                y="Avg Rating When Present",
+                text="Theme",
+                size="Frequency (%)",
+                color="Avg Rating When Present",
+                color_continuous_scale="RdYlGn"
             )
-            fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-            fig.update_layout(template="plotly_dark", yaxis={"categoryorder":"total ascending"})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig,use_container_width=True)
 
-    with col_b:
-        st.subheader("🛑 Top Barriers")
+        st.markdown("---")
 
-        if barriers_df.empty:
-            st.info("No negative reviews.")
-        else:
-            base = len(barriers_df)
-            counts = barriers_df[theme_cols].sum().sort_values(ascending=False).head(10)
-            pct = (counts / base * 100).round(1)
+        # AGGREGATED DRIVERS & BARRIERS
 
-            fig = px.bar(
-                x=pct.values,
-                y=pct.index,
-                orientation="h",
-                text=pct.values,
-                color_discrete_sequence=["#ef4444"]
-            )
-            fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-            fig.update_layout(template="plotly_dark", yaxis={"categoryorder":"total ascending"})
-            st.plotly_chart(fig, use_container_width=True)
+        pos_df = df[df["rating"]>=4]
+        neg_df = df[df["rating"]<=3]
+
+        col1,col2 = st.columns(2)
+
+        with col1:
+            st.subheader("🚀 Top Drivers")
+            if not pos_df.empty:
+                base = len(pos_df)
+                counts = pos_df[theme_cols].sum().sort_values(ascending=False).head(10)
+                pct = counts/base*100
+                fig = px.bar(x=pct.values,y=pct.index,orientation="h",
+                             color_discrete_sequence=["#10b981"])
+                st.plotly_chart(fig,use_container_width=True)
+
+        with col2:
+            st.subheader("🛑 Top Barriers")
+            if not neg_df.empty:
+                base = len(neg_df)
+                counts = neg_df[theme_cols].sum().sort_values(ascending=False).head(10)
+                pct = counts/base*100
+                fig = px.bar(x=pct.values,y=pct.index,orientation="h",
+                             color_discrete_sequence=["#ef4444"])
+                st.plotly_chart(fig,use_container_width=True)
