@@ -245,70 +245,111 @@ if nav == "📊 Boardroom Summary":
         st.metric("1★ Risk %", f"{risk:.1f}%")
 
 # ==========================================================
-# TAB 2 — DRIVERS & BARRIERS
-# ==========================================================
-
 elif nav == "🚀 Drivers & Barriers":
 
     st.markdown("### 🎯 Strategic Impact Matrix")
 
     if not theme_cols:
         st.warning("No NET columns detected.")
-    else:
+        st.stop()
 
-        # IMPACT MATRIX
-        stats = []
-        total_reviews = len(df)
+    total_reviews = len(df)
 
-        for t in theme_cols:
-            count = df[t].sum()
-            if count > 0:
-                avg = df[df[t]==1]["rating"].mean()
-                stats.append({
-                    "Theme":t,
-                    "Frequency (%)":count/total_reviews*100,
-                    "Avg Rating When Present":avg
-                })
+    stats = []
 
-        impact_df = pd.DataFrame(stats)
+    for t in theme_cols:
 
-        if not impact_df.empty:
-            fig = px.scatter(
-                impact_df,
-                x="Frequency (%)",
-                y="Avg Rating When Present",
-                text="Theme",
-                size="Frequency (%)",
-                color="Avg Rating When Present",
-                color_continuous_scale="RdYlGn"
+        # ✅ FORCE NUMERIC CONVERSION
+        series = pd.to_numeric(df[t], errors="coerce").fillna(0)
+
+        count = series.sum()
+
+        # ✅ Safe numeric comparison
+        if float(count) > 0:
+
+            avg = df.loc[series == 1, "rating"].mean()
+
+            stats.append({
+                "Theme": t,
+                "Frequency (%)": (count / total_reviews) * 100,
+                "Avg Rating When Present": avg
+            })
+
+    impact_df = pd.DataFrame(stats)
+
+    if impact_df.empty:
+        st.warning("Themes detected but no positive frequency found.")
+        st.stop()
+
+    fig = px.scatter(
+        impact_df,
+        x="Frequency (%)",
+        y="Avg Rating When Present",
+        text="Theme",
+        size="Frequency (%)",
+        color="Avg Rating When Present",
+        color_continuous_scale="RdYlGn"
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # ======================================================
+    # AGGREGATED DRIVERS & BARRIERS (SAFE VERSION)
+    # ======================================================
+
+    pos_df = df[df["rating"] >= 4]
+    neg_df = df[df["rating"] <= 3]
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("🚀 Top Drivers")
+
+        if not pos_df.empty:
+
+            base = len(pos_df)
+
+            theme_data = {}
+
+            for t in theme_cols:
+                series = pd.to_numeric(pos_df[t], errors="coerce").fillna(0)
+                theme_data[t] = series.sum()
+
+            counts = pd.Series(theme_data).sort_values(ascending=False).head(10)
+            pct = counts / base * 100
+
+            fig = px.bar(
+                x=pct.values,
+                y=pct.index,
+                orientation="h",
+                color_discrete_sequence=["#10b981"]
             )
-            st.plotly_chart(fig,use_container_width=True)
 
-        st.markdown("---")
+            st.plotly_chart(fig, use_container_width=True)
 
-        # AGGREGATED DRIVERS & BARRIERS
+    with col2:
+        st.subheader("🛑 Top Barriers")
 
-        pos_df = df[df["rating"]>=4]
-        neg_df = df[df["rating"]<=3]
+        if not neg_df.empty:
 
-        col1,col2 = st.columns(2)
+            base = len(neg_df)
 
-        with col1:
-            st.subheader("🚀 Top Drivers")
-            if not pos_df.empty:
-                base = len(pos_df)
-                counts = pos_df[theme_cols].sum().sort_values(ascending=False).head(10)
-                pct = counts/base*100
-                fig = px.bar(x=pct.values,y=pct.index,orientation="h",
-                             color_discrete_sequence=["#10b981"])
-                st.plotly_chart(fig,use_container_width=True)
+            theme_data = {}
 
-        with col2:
-            st.subheader("🛑 Top Barriers")
-            if not neg_df.empty:
-                base = len(neg_df)
-                counts = neg_df[theme_cols].sum().sort_values(ascending=False).head(10)
-                pct = counts/base*100
-                fig = px.bar(x=pct.values,y=pct.index,orientation="h",
-                             color_discrete_sequence=["#ef4444"])
-                st.plotly_chart(fig,use_container_width=True)
+            for t in theme_cols:
+                series = pd.to_numeric(neg_df[t], errors="coerce").fillna(0)
+                theme_data[t] = series.sum()
+
+            counts = pd.Series(theme_data).sort_values(ascending=False).head(10)
+            pct = counts / base * 100
+
+            fig = px.bar(
+                x=pct.values,
+                y=pct.index,
+                orientation="h",
+                color_discrete_sequence=["#ef4444"]
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
