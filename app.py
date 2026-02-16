@@ -6,28 +6,22 @@ import numpy as np
 from google.cloud import bigquery
 from google.oauth2 import service_account
 from datetime import datetime, timedelta
-import pytz
 from collections import Counter
 import re
 
-# =====================================================
-# CONFIG
-# =====================================================
-
-PROJECT_ID = "app-review-analyzer-487309"
-DATASET = "app_reviews_ds"
-TABLE = "raw_reviews"
-
-# =====================================================
+# ==========================================================
 # PAGE CONFIG
-# =====================================================
+# ==========================================================
 
 st.set_page_config(
     page_title="Strategic Intelligence Platform",
     page_icon="🦅",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
+
+# ==========================================================
+# DARK EXECUTIVE CSS
+# ==========================================================
 
 st.markdown("""
 <style>
@@ -36,266 +30,247 @@ div[data-testid="metric-container"] {
     background: linear-gradient(180deg, #1e293b 0%, #0f172a 100%);
     border: 1px solid #334155;
     border-radius: 12px;
-    padding: 18px;
+    padding: 20px;
 }
+hr { border-color: #334155; }
 </style>
 """, unsafe_allow_html=True)
 
-# =====================================================
+# ==========================================================
 # BIGQUERY CONNECTION
-# =====================================================
+# ==========================================================
 
 @st.cache_resource
 def init_bq():
     credentials = service_account.Credentials.from_service_account_info(
         st.secrets["gcp_service_account"]
     )
-    return bigquery.Client(credentials=credentials, project=PROJECT_ID)
+    return bigquery.Client(
+        credentials=credentials,
+        project=credentials.project_id
+    )
 
 bq = init_bq()
 
-# =====================================================
-# DATA LOADER
-# =====================================================
+# ==========================================================
+# LOAD DATA FROM BIGQUERY
+# ==========================================================
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=900)
 def load_data():
-    query = f"""
+    query = """
     SELECT *
-    FROM `{PROJECT_ID}.{DATASET}.{TABLE}`
+    FROM `app-review-analyzer-487309.app_reviews_ds.raw_reviews`
     """
-    return bq.query(query).to_dataframe()
+    df = bq.query(query).to_dataframe()
 
-df = load_data()
+    # ✅ FIX TIMEZONE ISSUE (CRITICAL)
+    df["date"] = (
+        pd.to_datetime(df["date"], utc=True)
+        .dt.tz_convert("Asia/Kolkata")
+        .dt.tz_localize(None)
+    )
 
-if df.empty:
-    st.error("No data found.")
+    df["Month"] = df["date"].dt.strftime("%Y-%m")
+    df["Week"] = df["date"].dt.strftime("%Y-W%V")
+
+    df["rating"] = pd.to_numeric(df["rating"], errors="coerce")
+
+    df["Sentiment_Label"] = pd.cut(
+        df["rating"],
+        bins=[0, 2, 3, 5],
+        labels=["Negative", "Neutral", "Positive"]
+    )
+
+    return df
+
+df_raw = load_data()
+
+if df_raw.empty:
+    st.error("No Data Found.")
     st.stop()
 
-# =====================================================
-# DATA PREP
-# =====================================================
+# ==========================================================
+# AUTO DETECT NET COLUMNS (0/1)
+# ==========================================================
 
-df["date"] = pd.to_datetime(df["date"])
-df["Month"] = df["date"].dt.strftime("%Y-%m")
-df["Week"] = df["date"].dt.strftime("%Y-W%V")
-df["score"] = pd.to_numeric(df["rating"])
+def detect_net_columns(df):
+    net_cols = []
+    for col in df.columns:
+        if df[col].dtype in [np.int64, np.int32, np.int8]:
+            if set(df[col].dropna().unique()).issubset({0, 1}):
+                net_cols.append(col)
+    return net_cols
 
-# Detect NET columns automatically (binary INT fields)
-core_cols = [
-    "app_id","brand_name","review_id","date",
-    "content","rating","sentiment",
-    "products","themes","Month","Week","score"
-]
+theme_cols = detect_net_columns(df_raw)
 
-net_cols = [
-    c for c in df.columns
-    if c not in core_cols and df[c].dropna().isin([0,1]).all()
-]
-
-# =====================================================
-# SIDEBAR
-# =====================================================
+# ==========================================================
+# SIDEBAR FILTERS
+# ==========================================================
 
 with st.sidebar:
-    st.title("🎛 Command Center")
+    st.title("🎛️ Command Center")
+    st.success(f"🟢 Live Rows: {len(df_raw):,}")
 
-    brands = sorted(df["brand_name"].unique())
-    sel_brands = st.multiselect("Brands", brands, default=brands)
-
-    min_d = df["date"].min()
-    max_d = df["date"].max()
-
+    min_d, max_d = df_raw["date"].min().date(), df_raw["date"].max().date()
     date_range = st.date_input(
-        "Date Range",
+        "Period",
         [min_d, max_d],
         min_value=min_d,
         max_value=max_d
     )
 
-    sel_ratings = st.multiselect(
-        "Ratings",
-        [1,2,3,4,5],
-        default=[1,2,3,4,5]
-    )
+    brands = sorted(df_raw["brand_name"].dropna().unique())
+    sel_brands = st.multiselect("Brands", brands, default=brands)
 
-# =====================================================
-# FILTERING
-# =====================================================
+    ratings = st.multiselect("Ratings", [1,2,3,4,5], default=[1,2,3,4,5])
 
-mask = df["brand_name"].isin(sel_brands)
-mask &= df["score"].isin(sel_ratings)
+# ==========================================================
+# APPLY FILTERS (FIXED VERSION)
+# ==========================================================
+
+df = df_raw.copy()
+
+mask = pd.Series(True, index=df.index)
 
 if len(date_range) == 2:
-    mask &= df["date"].between(
-        pd.to_datetime(date_range[0]),
-        pd.to_datetime(date_range[1])
-    )
+    start = pd.to_datetime(date_range[0])
+    end = pd.to_datetime(date_range[1]) + timedelta(days=1)
+    mask &= (df["date"] >= start) & (df["date"] < end)
+
+mask &= df["brand_name"].isin(sel_brands)
+mask &= df["rating"].isin(ratings)
 
 df = df[mask]
 
-# =====================================================
-# HEADER
-# =====================================================
+# ==========================================================
+# DASHBOARD
+# ==========================================================
 
 st.title("🦅 Strategic Intelligence Platform")
+st.markdown("---")
 
-ist = pytz.timezone("Asia/Kolkata")
-st.caption(f"Live | {datetime.now(ist).strftime('%d %b %Y %I:%M %p IST')}")
+# ==========================================================
+# KPI SECTION
+# ==========================================================
 
-nav = st.radio(
-    "",
-    [
-        "📊 Boardroom",
-        "🚀 Drivers & Barriers",
-        "⚔️ Head-to-Head",
-        "📅 Period Matrix",
-        "📈 Trends",
-        "🔡 Text Analytics"
-    ],
-    horizontal=True
-)
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    st.metric("Total Reviews", f"{len(df):,}")
+
+with col2:
+    st.metric("Avg Rating", f"{df['rating'].mean():.2f} ⭐")
+
+with col3:
+    promoters = len(df[df["rating"] == 5])
+    detractors = len(df[df["rating"] <= 3])
+    total = len(df)
+    nps = ((promoters - detractors) / total * 100) if total else 0
+    st.metric("NPS Proxy", f"{nps:.0f}")
+
+with col4:
+    risk = (len(df[df["rating"] == 1]) / total * 100) if total else 0
+    st.metric("1★ Risk %", f"{risk:.1f}%")
 
 st.markdown("---")
 
-# =====================================================
-# TAB 1 — BOARDROOM
-# =====================================================
+# ==========================================================
+# BRAND SHARE
+# ==========================================================
 
-if nav == "📊 Boardroom":
+st.subheader("📊 Volume Share by Brand")
 
-    col1, col2, col3, col4 = st.columns(4)
+brand_vol = df.groupby("brand_name").size().reset_index(name="Volume")
 
-    total = len(df)
-    avg = df["score"].mean()
+fig_donut = px.pie(
+    brand_vol,
+    values="Volume",
+    names="brand_name",
+    hole=0.5
+)
 
-    prom = len(df[df["score"]==5])
-    det = len(df[df["score"]<=3])
-    nps = ((prom - det)/total*100) if total else 0
-    risk = (len(df[df["score"]==1])/total*100) if total else 0
+fig_donut.update_layout(template="plotly_dark")
+st.plotly_chart(fig_donut, use_container_width=True)
 
-    col1.metric("Total Reviews", f"{total:,}")
-    col2.metric("Average Rating", f"{avg:.2f} ⭐")
-    col3.metric("NPS Proxy", f"{nps:.0f}")
-    col4.metric("1★ Risk %", f"{risk:.1f}%")
+# ==========================================================
+# SENTIMENT SPLIT
+# ==========================================================
 
-    st.markdown("### Brand Performance")
+st.subheader("😊 Sentiment Split")
 
-    brand_kpi = df.groupby("brand_name").agg(
-        Volume=("score","count"),
-        Avg_Rating=("score","mean")
-    ).reset_index()
+sent_df = (
+    df.groupby(["brand_name", "Sentiment_Label"])
+    .size()
+    .reset_index(name="Count")
+)
 
-    fig = px.scatter(
-        brand_kpi,
-        x="Avg_Rating",
-        y="Volume",
-        size="Volume",
-        color="brand_name",
-        title="Strategic Positioning"
+fig_sent = px.bar(
+    sent_df,
+    x="brand_name",
+    y="Count",
+    color="Sentiment_Label",
+    barmode="stack"
+)
+
+fig_sent.update_layout(template="plotly_dark")
+st.plotly_chart(fig_sent, use_container_width=True)
+
+# ==========================================================
+# TOP THEMES (NET)
+# ==========================================================
+
+st.subheader("🚀 Top Themes (Overall)")
+
+if theme_cols:
+    theme_counts = (
+        df[theme_cols]
+        .sum()
+        .sort_values(ascending=False)
+        .head(15)
     )
-    fig.update_layout(template="plotly_dark")
-    st.plotly_chart(fig, use_container_width=True)
 
-# =====================================================
-# TAB 2 — DRIVERS & BARRIERS
-# =====================================================
+    theme_df = pd.DataFrame({
+        "Theme": theme_counts.index,
+        "Count": theme_counts.values
+    })
 
-elif nav == "🚀 Drivers & Barriers":
+    fig_theme = px.bar(
+        theme_df,
+        x="Count",
+        y="Theme",
+        orientation="h"
+    )
 
-    st.subheader("Top Drivers (4–5★)")
-    pos = df[df["score"]>=4]
+    fig_theme.update_layout(
+        template="plotly_dark",
+        yaxis={"categoryorder":"total ascending"}
+    )
 
-    if not pos.empty and net_cols:
-        drivers = pos[net_cols].sum().sort_values(ascending=False).head(10)
-        ddf = pd.DataFrame({
-            "NET": drivers.index,
-            "Pct": drivers.values / len(pos) * 100
-        })
+    st.plotly_chart(fig_theme, use_container_width=True)
 
-        fig = px.bar(ddf, x="Pct", y="NET", orientation="h")
-        fig.update_layout(template="plotly_dark")
-        st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("No NET columns detected.")
 
-    st.subheader("Top Barriers (1–3★)")
-    neg = df[df["score"]<=3]
+# ==========================================================
+# MONTHLY TREND
+# ==========================================================
 
-    if not neg.empty and net_cols:
-        barriers = neg[net_cols].sum().sort_values(ascending=False).head(10)
-        bdf = pd.DataFrame({
-            "NET": barriers.index,
-            "Pct": barriers.values / len(neg) * 100
-        })
+st.subheader("📈 Monthly CSAT Trend")
 
-        fig2 = px.bar(bdf, x="Pct", y="NET", orientation="h")
-        fig2.update_layout(template="plotly_dark")
-        st.plotly_chart(fig2, use_container_width=True)
+trend = (
+    df.groupby(["Month", "brand_name"])["rating"]
+    .mean()
+    .reset_index()
+)
 
-# =====================================================
-# TAB 3 — HEAD TO HEAD
-# =====================================================
+fig_trend = px.line(
+    trend,
+    x="Month",
+    y="rating",
+    color="brand_name",
+    markers=True
+)
 
-elif nav == "⚔️ Head-to-Head":
-
-    if len(sel_brands) >= 2:
-        b1 = sel_brands[0]
-        b2 = sel_brands[1]
-
-        df1 = df[df["brand_name"]==b1]
-        df2 = df[df["brand_name"]==b2]
-
-        comp = pd.DataFrame({
-            "Metric":["Avg Rating","Volume"],
-            b1:[df1["score"].mean(), len(df1)],
-            b2:[df2["score"].mean(), len(df2)]
-        })
-
-        st.dataframe(comp)
-
-# =====================================================
-# TAB 4 — PERIOD MATRIX
-# =====================================================
-
-elif nav == "📅 Period Matrix":
-
-    grain = st.selectbox("Time Grain", ["Month","Week"])
-
-    period_col = "Month" if grain=="Month" else "Week"
-
-    matrix = df.groupby([period_col,"brand_name"]).size().unstack(fill_value=0)
-
-    st.dataframe(matrix)
-
-# =====================================================
-# TAB 5 — TRENDS
-# =====================================================
-
-elif nav == "📈 Trends":
-
-    trend = df.groupby(["Month","brand_name"])["score"].mean().reset_index()
-
-    fig = px.line(trend, x="Month", y="score", color="brand_name", markers=True)
-    fig.update_layout(template="plotly_dark")
-    st.plotly_chart(fig, use_container_width=True)
-
-# =====================================================
-# TAB 6 — TEXT ANALYTICS
-# =====================================================
-
-elif nav == "🔡 Text Analytics":
-
-    st.subheader("Top Words (Negative Reviews)")
-
-    neg = df[df["score"]<=3]
-
-    words = Counter()
-    for text in neg["content"].dropna():
-        clean = re.sub(r"[^a-zA-Z ]","", text.lower())
-        words.update(clean.split())
-
-    common = words.most_common(20)
-    tdf = pd.DataFrame(common, columns=["Word","Count"])
-
-    fig = px.bar(tdf, x="Count", y="Word", orientation="h")
-    fig.update_layout(template="plotly_dark")
-    st.plotly_chart(fig, use_container_width=True)
+fig_trend.update_layout(template="plotly_dark")
+st.plotly_chart(fig_trend, use_container_width=True)
