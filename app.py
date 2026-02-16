@@ -3,12 +3,12 @@ import pandas as pd
 import numpy as np
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 # =====================================================
-# PAGE CONFIG
+# PAGE
 # =====================================================
-st.set_page_config(layout="wide", page_title="Monthly Brand Comparison")
+st.set_page_config(layout="wide", page_title="Brand Theme Intelligence")
 st.title("📊 Brand Theme Intelligence")
 
 # =====================================================
@@ -27,16 +27,15 @@ def get_client():
 @st.cache_data(ttl=600)
 def load_data():
 
-    query = """
+    query="""
         SELECT *
         FROM `app-review-analyzer-487309.app_reviews_ds.raw_reviews`
-        WHERE DATE(date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 12 MONTH)
+        WHERE DATE(date)>=DATE_SUB(CURRENT_DATE(),INTERVAL 12 MONTH)
     """
 
-    df = get_client().query(query).to_dataframe()
+    df=get_client().query(query).to_dataframe()
 
-    # ---------- STANDARDIZE COLUMNS ----------
-    cols = {c.lower():c for c in df.columns}
+    cols={c.lower():c for c in df.columns}
 
     def find(names):
         for n in names:
@@ -44,50 +43,44 @@ def load_data():
                 return cols[n.lower()]
         return None
 
-    brand_col = find(["brand","app_name","brand_name"])
-    date_col = find(["date","review_date"])
-    rating_col = find(["rating","score"])
+    brand=find(["brand","app_name","brand_name"])
+    date=find(["date","review_date"])
+    rating=find(["rating","score"])
 
-    if not brand_col or not date_col or not rating_col:
+    if not brand or not date or not rating:
         st.error("Required columns missing.")
         st.stop()
 
-    df = df.rename(columns={
-        brand_col:"Brand",
-        date_col:"Date",
-        rating_col:"Rating"
-    })
+    df=df.rename(columns={brand:"Brand",date:"Date",rating:"Rating"})
 
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True)
-    df = df.dropna(subset=["Date"])
+    df["Date"]=pd.to_datetime(df["Date"],errors="coerce",utc=True)
+    df=df.dropna(subset=["Date"])
 
-    df["Month"] = df["Date"].dt.to_period("M").astype(str)
-    df["Week"] = df["Date"].dt.strftime("%Y-W%U")
+    df["Month"]=df["Date"].dt.to_period("M").astype(str)
+    df["Week"]=df["Date"].dt.strftime("%Y-W%U")
 
-    # ---------- DETECT THEMES ----------
-    exclude = {"Brand","Date","Rating","Month","Week","review_id","content","sentiment","products"}
-    theme_cols = [c for c in df.columns if c not in exclude and df[c].dropna().isin([0,1]).all()]
+    exclude={"Brand","Date","Rating","Month","Week","review_id","content","sentiment","products"}
+    theme_cols=[c for c in df.columns if c not in exclude and df[c].dropna().isin([0,1]).all()]
 
-    # ---------- NET MAP ----------
+    # NET grouping
     net_map={}
     for col in theme_cols:
 
         if col.startswith("[NET]"):
-            net = col.replace("[NET]","").split("_")[0]
-            theme = col.replace("[NET]","")
+            net=col.replace("[NET]","").split("_")[0]
+            theme=col.replace("[NET]","")
         else:
-            net = col.split("_")[0]
-            theme = col
+            net=col.split("_")[0]
+            theme=col
 
         net_map.setdefault(net,[]).append(theme)
 
-    return df, net_map
+    return df,net_map
 
-
-df, net_map = load_data()
+df,net_map=load_data()
 
 if df.empty:
-    st.warning("No data found")
+    st.warning("No data")
     st.stop()
 
 # =====================================================
@@ -95,48 +88,40 @@ if df.empty:
 # =====================================================
 st.sidebar.header("📅 Time Filter")
 
-filter_type = st.sidebar.selectbox(
-    "Select Range",
-    ["Weekly","Monthly","Last 3 Months","Quarterly","Last 6 Months","Custom"]
+mode=st.sidebar.selectbox(
+    "Range",
+    ["Weekly","Monthly","3 Months","Quarterly","6 Months","Custom"]
 )
 
-today = df["Date"].max()
+today=df["Date"].max()
 
-if filter_type=="Weekly":
-    start = today - timedelta(days=7)
-
-elif filter_type=="Monthly":
-    start = today - timedelta(days=30)
-
-elif filter_type=="Last 3 Months":
-    start = today - timedelta(days=90)
-
-elif filter_type=="Quarterly":
-    start = today - timedelta(days=120)
-
-elif filter_type=="Last 6 Months":
-    start = today - timedelta(days=180)
-
+if mode=="Weekly":
+    start=today-timedelta(days=7)
+elif mode=="Monthly":
+    start=today-timedelta(days=30)
+elif mode=="3 Months":
+    start=today-timedelta(days=90)
+elif mode=="Quarterly":
+    start=today-timedelta(days=120)
+elif mode=="6 Months":
+    start=today-timedelta(days=180)
 else:
-    start,end = st.sidebar.date_input(
-        "Custom Range",
-        [today - timedelta(days=30), today]
-    )
+    start,end=st.sidebar.date_input("Custom",[today-timedelta(days=30),today])
     start=pd.to_datetime(start,utc=True)
     end=pd.to_datetime(end,utc=True)+timedelta(days=1)
 
-if filter_type!="Custom":
+if mode!="Custom":
     end=today
 
-df = df[(df["Date"]>=start)&(df["Date"]<=end)]
+df=df[(df["Date"]>=start)&(df["Date"]<=end)]
 
 # =====================================================
-# HEATMAP COLOR FUNCTION
+# HEATMAP
 # =====================================================
-def heatmap_style(df):
+def heatmap(df):
 
     vals=df.values.flatten()
-    vals=vals[~pd.isna(vals)]
+    vals=vals[~np.isnan(vals)]
 
     if len(vals)==0:
         return df
@@ -146,15 +131,16 @@ def heatmap_style(df):
     def color(v):
         if pd.isna(v): return ""
         if vmax==vmin: return ""
-        ratio=(v-vmin)/(vmax-vmin)
-        r=int(255*(1-ratio))
-        g=int(255*ratio)
+
+        r=int(255*(1-(v-vmin)/(vmax-vmin)))
+        g=int(255*((v-vmin)/(vmax-vmin)))
+
         return f"background-color: rgb({r},{g},120)"
 
-    return df.style.applymap(color).format("{:.0%}")
+    return df.style.map(color).format("{:.0%}")
 
 # =====================================================
-# TABLE BUILDER
+# TABLE BUILDER WITH RANKING
 # =====================================================
 def build_table(ratings):
 
@@ -163,28 +149,26 @@ def build_table(ratings):
         return pd.DataFrame()
 
     brands=sorted(d["Brand"].dropna().unique())
-
     months=sorted(d["Month"].unique())[-6:]
+
     base=d.groupby(["Brand","Month"]).size().unstack(fill_value=0)
 
     rows=[]
 
-    for net,themes in sorted(net_map.items()):
+    for net,themes in net_map.items():
 
-        # ---------- NET ROW ----------
         net_subset=d[d[themes].sum(axis=1)>0]
 
-        net_row={"Label":f"▶ {net}"}
+        row={"Label":f"▶ {net}"}
 
         for m in months:
             for b in brands:
                 b_base=base.get(m,pd.Series()).get(b,0) if m in base.columns else 0
                 val=net_subset[(net_subset["Month"]==m)&(net_subset["Brand"]==b)].shape[0]
-                net_row[f"{m}|{b}"]=val/b_base if b_base else 0
+                row[f"{m}|{b}"]=val/b_base if b_base else 0
 
-        rows.append(net_row)
+        rows.append(row)
 
-        # ---------- THEMES ----------
         for t in themes:
 
             sub=d[d[t]==1]
@@ -198,10 +182,18 @@ def build_table(ratings):
 
             rows.append(row)
 
-        rows.append({"Label":""})
+    out=pd.DataFrame(rows).set_index("Label").fillna(0).astype(float)
 
-    return pd.DataFrame(rows).set_index("Label")
+    # =====================================================
+    # SORT BY LATEST MONTH %
+    # =====================================================
+    latest_cols=[c for c in out.columns if months[-1] in c]
 
+    if latest_cols:
+        out["__rank"]=out[latest_cols].mean(axis=1)
+        out=out.sort_values("__rank",ascending=False).drop(columns="__rank")
+
+    return out
 
 # =====================================================
 # TABS
@@ -218,8 +210,7 @@ with tab1:
     if table.empty:
         st.info("No driver data")
     else:
-        st.dataframe(heatmap_style(table),use_container_width=True)
-
+        st.dataframe(heatmap(table),use_container_width=True)
 
 # =====================================================
 # BARRIERS
@@ -231,4 +222,4 @@ with tab2:
     if table.empty:
         st.info("No barrier data")
     else:
-        st.dataframe(heatmap_style(table),use_container_width=True)
+        st.dataframe(heatmap(table),use_container_width=True)
