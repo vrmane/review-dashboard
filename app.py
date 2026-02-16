@@ -239,64 +239,94 @@ fig_trend.update_layout(template="plotly_dark")
 st.plotly_chart(fig_trend, use_container_width=True)
 
 # ==========================================================
+# ==========================================================
 # DRIVERS & BARRIERS
 # ==========================================================
 
 st.markdown("---")
 st.header("🚀 Drivers & 🛑 Barriers")
 
-if theme_cols:
+if not theme_cols:
+    st.warning("No NET columns detected.")
+else:
 
     drivers_df = df[df["rating"] >= 4]
     barriers_df = df[df["rating"] <= 3]
 
     col_d, col_b = st.columns(2)
 
+    # ------------------- DRIVERS -------------------
     with col_d:
         st.subheader("🚀 Top Drivers")
 
-        if not drivers_df.empty:
+        if drivers_df.empty:
+            st.info("No positive reviews in selection.")
+        else:
             base = len(drivers_df)
-            counts = drivers_df[theme_cols].sum().sort_values(ascending=False).head(10)
-            pct = (counts / base * 100).round(1)
 
-            plot_df = pd.DataFrame({"Theme": counts.index, "Pct": pct.values})
+            counts = drivers_df[theme_cols].apply(pd.to_numeric, errors="coerce").sum()
+            counts = counts.sort_values(ascending=False).head(10)
 
-            fig = px.bar(
-                plot_df,
-                x="Pct",
-                y="Theme",
-                orientation="h",
-                text="Pct",
-                color_discrete_sequence=["#10b981"]
-            )
+            if counts.sum() == 0:
+                st.info("No driver themes detected.")
+            else:
+                pct = (counts / base * 100).round(1)
 
-            fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-            fig.update_layout(template="plotly_dark", yaxis={"categoryorder":"total ascending"})
-            st.plotly_chart(fig, use_container_width=True)
+                plot_df = pd.DataFrame({
+                    "Theme": counts.index,
+                    "Pct": pct.values
+                })
 
+                fig = px.bar(
+                    plot_df,
+                    x="Pct",
+                    y="Theme",
+                    orientation="h",
+                    text="Pct",
+                    color_discrete_sequence=["#10b981"]
+                )
+
+                fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+                fig.update_layout(template="plotly_dark", yaxis={"categoryorder":"total ascending"})
+
+                st.plotly_chart(fig, use_container_width=True)
+
+    # ------------------- BARRIERS -------------------
     with col_b:
         st.subheader("🛑 Top Barriers")
 
-        if not barriers_df.empty:
+        if barriers_df.empty:
+            st.info("No negative reviews in selection.")
+        else:
             base = len(barriers_df)
-            counts = barriers_df[theme_cols].sum().sort_values(ascending=False).head(10)
-            pct = (counts / base * 100).round(1)
 
-            plot_df = pd.DataFrame({"Theme": counts.index, "Pct": pct.values})
+            counts = barriers_df[theme_cols].apply(pd.to_numeric, errors="coerce").sum()
+            counts = counts.sort_values(ascending=False).head(10)
 
-            fig = px.bar(
-                plot_df,
-                x="Pct",
-                y="Theme",
-                orientation="h",
-                text="Pct",
-                color_discrete_sequence=["#ef4444"]
-            )
+            if counts.sum() == 0:
+                st.info("No barrier themes detected.")
+            else:
+                pct = (counts / base * 100).round(1)
 
-            fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-            fig.update_layout(template="plotly_dark", yaxis={"categoryorder":"total ascending"})
-            st.plotly_chart(fig, use_container_width=True)
+                plot_df = pd.DataFrame({
+                    "Theme": counts.index,
+                    "Pct": pct.values
+                })
+
+                fig = px.bar(
+                    plot_df,
+                    x="Pct",
+                    y="Theme",
+                    orientation="h",
+                    text="Pct",
+                    color_discrete_sequence=["#ef4444"]
+                )
+
+                fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+                fig.update_layout(template="plotly_dark", yaxis={"categoryorder":"total ascending"})
+
+                st.plotly_chart(fig, use_container_width=True)
+
 
 # ==========================================================
 # IMPACT MATRIX
