@@ -1,317 +1,258 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+import numpy as np
+import json
+import re
+import gc
+import pytz
+from collections import Counter
+from datetime import timedelta, datetime
 from google.cloud import bigquery
+from google.oauth2 import service_account
 
 # =====================================================
 # CONFIG
 # =====================================================
 
 PROJECT_ID = "app-review-analyzer-487309"
-DATASET_ID = "app_reviews_ds"
-TABLE_ID = "raw_reviews"
+DATASET = "app_reviews_ds"
+TABLE = "raw_reviews"
 
-st.set_page_config(layout="wide")
-st.title("📊 App Review Intelligence Dashboard")
+st.set_page_config(page_title="Strategic Intelligence Platform", layout="wide")
 
 # =====================================================
-# DATA LOAD
+# BIGQUERY CONNECTION
+# =====================================================
+
+@st.cache_resource
+def get_client():
+    creds = service_account.Credentials.from_service_account_info(
+        st.secrets["GCP_SERVICE_ACCOUNT"]
+    )
+    return bigquery.Client(credentials=creds, project=creds.project_id)
+
+# =====================================================
+# DATA LOADER
 # =====================================================
 
 @st.cache_data(ttl=600)
-def load_data(days=120, limit=150000):
+def load_data(days=365):
 
-    client = bigquery.Client()
+    client = get_client()
 
     query = f"""
-        SELECT
-            review_id,
-            brand_name,
-            rating,
-            sentiment,
-            themes,
-            date
-        FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
-        WHERE DATE(date) >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
-        ORDER BY date DESC
-        LIMIT {limit}
+    SELECT *
+    FROM `{PROJECT_ID}.{DATASET}.{TABLE}`
+    WHERE DATE(date) >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
     """
 
     df = client.query(query).to_dataframe()
+
+    if df.empty:
+        return df
+
+    ist = pytz.timezone("Asia/Kolkata")
+
+    # DATE
+    df["at"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["at"])
+    df["at"] = df["at"].dt.tz_localize("UTC").dt.tz_convert(ist)
+
+    df["Month"] = df["at"].dt.strftime("%Y-%m")
+    df["Week"] = df["at"].dt.strftime("%Y-W%V")
+
+    # SCORE
+    df["score"] = pd.to_numeric(df["rating"], errors="coerce")
+
+    df["Sentiment_Label"] = pd.cut(
+        df["score"],
+        bins=[0,2,3,5],
+        labels=["Negative","Neutral","Positive"]
+    )
+
+    # TEXT
+    if "review_text" in df.columns:
+        df["char_count"] = df["review_text"].astype(str).str.len()
+        df["length_bucket"] = np.where(df["char_count"]<=29,"Brief","Detailed")
+
+    # AUTO THEME DETECTION
+    theme_cols = []
+    for col in df.columns:
+        try:
+            if df[col].dropna().isin([0,1]).all():
+                theme_cols.append(col)
+        except:
+            pass
+
+    st.session_state["theme_cols"] = theme_cols
+    st.session_state["last_fetched"] = datetime.now(ist).strftime("%d %b %Y %I:%M %p IST")
+
+    gc.collect()
     return df
 
 
-df = load_data()
+df_raw = load_data()
 
-if df.empty:
-    st.warning("No data available.")
+if df_raw.empty:
+    st.error("No data returned.")
     st.stop()
 
 # =====================================================
-# CLEANING
+# FILTERS
 # =====================================================
 
-df = df.copy()
-df = df.replace({pd.NA: None})
+with st.sidebar:
 
-df["date"] = pd.to_datetime(df["date"], errors="coerce")
-df["Month"] = df["date"].dt.to_period("M").astype(str)
+    st.title("Control Panel")
 
-df["Sentiment_Label"] = df["sentiment"].fillna("Neutral")
+    min_d = df_raw["at"].min().date()
+    max_d = df_raw["at"].max().date()
 
-df["Rating_Bucket"] = pd.cut(
-    df["rating"],
-    bins=[0,2,3,4,5],
-    labels=["1-2","3","4","5"]
+    dr = st.date_input("Date Range",[min_d,max_d])
+
+    brands = sorted(df_raw["brand_name"].dropna().unique())
+    sel_brands = st.multiselect("Brand",brands,default=brands)
+
+    ratings = st.multiselect("Ratings",[1,2,3,4,5],[1,2,3,4,5])
+
+# APPLY FILTER
+
+mask = pd.Series(True,index=df_raw.index)
+
+if len(dr)==2:
+    mask &= df_raw["at"].between(
+        pd.to_datetime(dr[0]).tz_localize("Asia/Kolkata"),
+        pd.to_datetime(dr[1]).tz_localize("Asia/Kolkata")
+    )
+
+mask &= df_raw["brand_name"].isin(sel_brands)
+mask &= df_raw["score"].isin(ratings)
+
+df = df_raw[mask]
+
+theme_cols = st.session_state.get("theme_cols",[])
+
+# =====================================================
+# KPI HEADER
+# =====================================================
+
+st.title("Strategic Intelligence Platform")
+
+last = st.session_state.get("last_fetched","now")
+st.caption(f"Last refresh → {last}")
+
+c1,c2,c3,c4 = st.columns(4)
+
+vol = len(df)
+avg = df["score"].mean()
+
+prom = len(df[df.score==5])
+det = len(df[df.score<=3])
+nps = ((prom-det)/vol*100) if vol else 0
+
+risk = len(df[df.score==1])/vol*100 if vol else 0
+
+c1.metric("Volume",vol)
+c2.metric("Avg Rating",f"{avg:.2f}")
+c3.metric("NPS Proxy",f"{nps:.0f}")
+c4.metric("Critical Risk %",f"{risk:.1f}")
+
+# =====================================================
+# BRAND TABLE
+# =====================================================
+
+st.subheader("Brand Performance")
+
+brand = df.groupby("brand_name").agg(
+    Reviews=("score","count"),
+    Rating=("score","mean")
+).reset_index()
+
+st.dataframe(brand,use_container_width=True)
+
+fig = px.scatter(
+    brand,
+    x="Reviews",
+    y="Rating",
+    size="Reviews",
+    hover_name="brand_name"
 )
+st.plotly_chart(fig,use_container_width=True)
 
 # =====================================================
-# SIDEBAR FILTERS
+# THEME IMPACT
 # =====================================================
 
-st.sidebar.header("Filters")
+st.subheader("Theme Impact")
 
-brand_filter = st.sidebar.multiselect(
-    "Brand",
-    sorted(df["brand_name"].dropna().unique())
-)
+if theme_cols:
 
-sentiment_filter = st.sidebar.multiselect(
-    "Sentiment",
-    sorted(df["Sentiment_Label"].unique())
-)
+    data=[]
+    total=len(df)
 
-rating_filter = st.sidebar.multiselect(
-    "Rating Bucket",
-    sorted(df["Rating_Bucket"].dropna().unique())
-)
+    for t in theme_cols:
+        count=df[t].sum()
+        if count>0:
+            avg=df.loc[df[t]==1,"score"].mean()
+            data.append([t,count/total*100,avg,count])
 
-date_range = st.sidebar.date_input(
-    "Date Range",
-    [df["date"].min(), df["date"].max()]
-)
+    imp=pd.DataFrame(data,columns=["Theme","Freq","Avg","Count"])
 
-# APPLY FILTERS
-
-mask = pd.Series(True, index=df.index)
-
-if brand_filter:
-    mask &= df["brand_name"].isin(brand_filter)
-
-if sentiment_filter:
-    mask &= df["Sentiment_Label"].isin(sentiment_filter)
-
-if rating_filter:
-    mask &= df["Rating_Bucket"].isin(rating_filter)
-
-if len(date_range) == 2:
-    mask &= df["date"].between(
-        pd.to_datetime(date_range[0]),
-        pd.to_datetime(date_range[1])
+    fig=px.scatter(
+        imp,
+        x="Freq",
+        y="Avg",
+        size="Count",
+        text="Theme",
+        color="Avg"
     )
-
-df = df[mask]
-
-# =====================================================
-# TABS
-# =====================================================
-
-tabs = st.tabs([
-    "Overview",
-    "Trends",
-    "Brand Intelligence",
-    "Theme Intelligence",
-    "Deep Dive Table"
-])
+    st.plotly_chart(fig,use_container_width=True)
 
 # =====================================================
-# OVERVIEW
+# TREND
 # =====================================================
 
-with tabs[0]:
+st.subheader("Trend")
 
-    total_reviews = len(df)
-    avg_rating = round(df["rating"].mean(),2)
-    neg_pct = (df["Sentiment_Label"]=="Negative").mean()*100
-    pos_pct = (df["Sentiment_Label"]=="Positive").mean()*100
+trend=df.groupby("Month").agg(
+    Reviews=("score","count"),
+    Rating=("score","mean")
+).reset_index()
 
-    col1,col2,col3,col4 = st.columns(4)
-
-    col1.metric("Total Reviews", total_reviews)
-    col2.metric("Avg Rating", avg_rating)
-    col3.metric("Positive %", f"{pos_pct:.1f}%")
-    col4.metric("Negative %", f"{neg_pct:.1f}%")
-
-    st.divider()
-
-    st.subheader("Sentiment Distribution")
-
-    fig = px.histogram(
-        df,
-        x="Sentiment_Label",
-        color="Sentiment_Label"
-    )
-    st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(px.line(trend,x="Month",y="Reviews"),use_container_width=True)
+st.plotly_chart(px.line(trend,x="Month",y="Rating"),use_container_width=True)
 
 # =====================================================
-# TRENDS
+# TEXT ANALYTICS
 # =====================================================
 
-with tabs[1]:
+if "review_text" in df.columns:
 
-    monthly = df.groupby("Month").agg(
-        Reviews=("review_id","count"),
-        Rating=("rating","mean"),
-        Negative=("Sentiment_Label",
-                  lambda x:(x=="Negative").mean()*100)
-    ).reset_index()
+    st.subheader("Top Words")
 
-    st.subheader("Review Trend")
+    stop=set(["the","and","for","this","that","app","loan","good","bad"])
 
-    st.plotly_chart(
-        px.line(monthly,x="Month",y="Reviews"),
-        use_container_width=True
-    )
+    counter=Counter()
 
-    st.subheader("Rating Trend")
+    for txt in df["review_text"].dropna():
+        words=re.sub(r"[^a-z ]","",txt.lower()).split()
+        words=[w for w in words if w not in stop and len(w)>2]
+        counter.update(words)
 
-    st.plotly_chart(
-        px.line(monthly,x="Month",y="Rating"),
-        use_container_width=True
-    )
+    words=pd.DataFrame(counter.most_common(20),columns=["Word","Count"])
 
-    st.subheader("Negative Trend")
-
-    st.plotly_chart(
-        px.line(monthly,x="Month",y="Negative"),
-        use_container_width=True
-    )
+    fig=px.bar(words,x="Count",y="Word",orientation="h")
+    st.plotly_chart(fig,use_container_width=True)
 
 # =====================================================
-# BRAND INTELLIGENCE
+# RAW
 # =====================================================
 
-with tabs[2]:
+st.subheader("Raw Data")
 
-    brand = df.groupby("brand_name").agg(
-        Reviews=("review_id","count"),
-        Rating=("rating","mean"),
-        Negative=("Sentiment_Label",
-                  lambda x:(x=="Negative").mean()*100)
-    ).reset_index().sort_values("Reviews",ascending=False)
+st.dataframe(df,use_container_width=True)
 
-    st.dataframe(brand,use_container_width=True)
-
-    st.subheader("Review Volume")
-
-    st.plotly_chart(
-        px.bar(brand,x="brand_name",y="Reviews"),
-        use_container_width=True
-    )
-
-    st.subheader("Brand Perception Map")
-
-    st.plotly_chart(
-        px.scatter(
-            brand,
-            x="Reviews",
-            y="Negative",
-            size="Reviews",
-            hover_name="brand_name"
-        ),
-        use_container_width=True
-    )
-
-# =====================================================
-# THEME INTELLIGENCE
-# =====================================================
-
-with tabs[3]:
-
-    theme_df = df.copy()
-
-    theme_df["themes"] = theme_df["themes"].apply(
-        lambda x: x if isinstance(x,list) else []
-    )
-
-    theme_df = theme_df.explode("themes")
-    theme_df["themes"] = theme_df["themes"].fillna("Unknown")
-
-    th = theme_df.groupby("themes").agg(
-        Reviews=("review_id","count"),
-        Negative=("Sentiment_Label",
-                  lambda x:(x=="Negative").mean()*100),
-        Rating=("rating","mean")
-    ).reset_index()
-
-    th["Impact_Score"] = th["Reviews"] * th["Negative"]
-
-    st.dataframe(
-        th.sort_values("Impact_Score",ascending=False),
-        use_container_width=True
-    )
-
-    st.subheader("Top Complaint Drivers")
-
-    st.plotly_chart(
-        px.bar(
-            th.sort_values("Impact_Score",ascending=False).head(15),
-            x="themes",
-            y="Impact_Score"
-        ),
-        use_container_width=True
-    )
-
-    st.subheader("Theme Performance Matrix")
-
-    st.plotly_chart(
-        px.scatter(
-            th,
-            x="Reviews",
-            y="Negative",
-            size="Impact_Score",
-            hover_name="themes"
-        ),
-        use_container_width=True
-    )
-
-# =====================================================
-# RAW DATA TABLE
-# =====================================================
-
-with tabs[4]:
-
-    st.dataframe(df,use_container_width=True)
-
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download Filtered Data",
-        csv,
-        "filtered_reviews.csv",
-        "text/csv"
-    )
-
-# =====================================================
-# AUTO INSIGHTS
-# =====================================================
-
-st.divider()
-st.subheader("Automated Insights")
-
-if not df.empty:
-
-    worst_theme = th.sort_values("Impact_Score",ascending=False).iloc[0]
-    best_brand = brand.sort_values("Rating",ascending=False).iloc[0]
-    worst_brand = brand.sort_values("Negative",ascending=False).iloc[0]
-
-    st.info(f"""
-    • Biggest pain point: **{worst_theme.themes}**
-    appears in **{int(worst_theme.Reviews)} reviews**
-    with **{worst_theme.Negative:.1f}% negative sentiment**
-
-    • Best performing brand: **{best_brand.brand_name}**
-    with avg rating **{best_brand.Rating:.2f}**
-
-    • Brand needing attention: **{worst_brand.brand_name}**
-    showing **{worst_brand.Negative:.1f}% negative sentiment**
-    """)
+csv=df.to_csv(index=False).encode("utf-8")
+st.download_button("Download CSV",csv,"data.csv","text/csv")
