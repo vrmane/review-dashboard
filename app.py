@@ -1,14 +1,12 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import numpy as np
-import json
 import re
 import gc
 import pytz
+from datetime import datetime
 from collections import Counter
-from datetime import timedelta, datetime
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -23,148 +21,173 @@ TABLE = "raw_reviews"
 st.set_page_config(page_title="Strategic Intelligence Platform", layout="wide")
 
 # =====================================================
-# AUTH CLIENT (BULLETPROOF)
+# AUTH CLIENT
 # =====================================================
 
 @st.cache_resource
 def get_client():
 
     if not st.secrets:
-        st.error("No Streamlit secrets found.")
+        st.error("No secrets found.")
         st.stop()
 
-    key_name = None
-
+    key = None
     if "gcp_service_account" in st.secrets:
-        key_name = "gcp_service_account"
-
+        key = "gcp_service_account"
     elif "GCP_SERVICE_ACCOUNT" in st.secrets:
-        key_name = "GCP_SERVICE_ACCOUNT"
-
+        key = "GCP_SERVICE_ACCOUNT"
     else:
-        st.error("No valid GCP credentials key found in secrets.")
+        st.error("Missing GCP credential block.")
         st.write("Available keys:", list(st.secrets.keys()))
         st.stop()
 
-    try:
-        creds_dict = dict(st.secrets[key_name])
+    creds = service_account.Credentials.from_service_account_info(
+        dict(st.secrets[key])
+    )
 
-        creds = service_account.Credentials.from_service_account_info(
-            creds_dict
-        )
+    return bigquery.Client(credentials=creds, project=creds.project_id)
 
-        return bigquery.Client(
-            credentials=creds,
-            project=creds.project_id
-        )
+# =====================================================
+# SCHEMA GUARD
+# =====================================================
 
-    except Exception as e:
-        st.error("Failed to initialize BigQuery client")
-        st.exception(e)
-        st.stop()
+REQUIRED_COLUMNS = {
+    "date": "datetime",
+    "rating": "numeric",
+    "brand_name": "string"
+}
+
+OPTIONAL_COLUMNS = [
+    "review_text",
+    "sentiment"
+]
+
+def validate_schema(df):
+
+    issues = []
+
+    # missing required
+    for col in REQUIRED_COLUMNS:
+        if col not in df.columns:
+            issues.append(f"Missing column → {col}")
+            df[col] = None
+
+    # enforce types
+    if "rating" in df.columns:
+        df["rating"] = pd.to_numeric(df["rating"], errors="coerce")
+
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    return df, issues
 
 # =====================================================
 # DATA LOADER
 # =====================================================
 
 @st.cache_data(ttl=600)
-def load_data(days=365):
+def load_data():
 
     client = get_client()
 
     query = f"""
     SELECT *
     FROM `{PROJECT_ID}.{DATASET}.{TABLE}`
-    WHERE DATE(date) >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+    WHERE DATE(date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY)
     """
 
-    try:
-        df = client.query(query).to_dataframe()
-    except Exception as e:
-        st.error("BigQuery query failed")
-        st.exception(e)
-        st.stop()
+    df = client.query(query).to_dataframe()
 
     if df.empty:
-        return df
+        return df, ["No rows returned"]
 
-    ist = pytz.timezone("Asia/Kolkata")
+    df, issues = validate_schema(df)
 
-    # ================= DATE =================
-
-    df["at"] = pd.to_datetime(df["date"], errors="coerce")
+    # timezone safe parsing
+    df["at"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
     df = df.dropna(subset=["at"])
-    df["at"] = df["at"].dt.tz_localize("UTC").dt.tz_convert(ist)
+    df["at"] = df["at"].dt.tz_convert("Asia/Kolkata")
 
     df["Month"] = df["at"].dt.strftime("%Y-%m")
     df["Week"] = df["at"].dt.strftime("%Y-W%V")
 
-    # ================= RATING =================
+    # score
+    df["score"] = df["rating"]
 
-    df["score"] = pd.to_numeric(df["rating"], errors="coerce")
+    # sentiment derive fallback
+    if "sentiment" not in df.columns:
+        df["Sentiment_Label"] = pd.cut(
+            df["score"],
+            bins=[0,2,3,5],
+            labels=["Negative","Neutral","Positive"]
+        )
+    else:
+        df["Sentiment_Label"] = df["sentiment"]
 
-    df["Sentiment_Label"] = pd.cut(
-        df["score"],
-        bins=[0,2,3,5],
-        labels=["Negative","Neutral","Positive"]
-    )
-
-    # ================= TEXT =================
-
+    # text metrics
     if "review_text" in df.columns:
         df["char_count"] = df["review_text"].astype(str).str.len()
-        df["length_bucket"] = np.where(df["char_count"]<=29,"Brief","Detailed")
 
-    # ================= THEME DETECTION =================
-
-    theme_cols = []
-
+    # theme detection
+    theme_cols=[]
     for col in df.columns:
         try:
-            unique_vals = df[col].dropna().unique()
-
-            if len(unique_vals) <= 2 and set(unique_vals).issubset({0,1}):
+            vals=df[col].dropna().unique()
+            if len(vals)<=2 and set(vals).issubset({0,1}):
                 theme_cols.append(col)
         except:
             pass
 
-    st.session_state["theme_cols"] = theme_cols
-    st.session_state["last_fetched"] = datetime.now(ist).strftime("%d %b %Y %I:%M %p IST")
+    st.session_state["theme_cols"]=theme_cols
+    st.session_state["health_issues"]=issues
+    st.session_state["last_refresh"]=datetime.now().strftime("%H:%M:%S")
 
     gc.collect()
+    return df, issues
 
-    return df
 
-
-df_raw = load_data()
+df_raw, issues = load_data()
 
 if df_raw.empty:
-    st.error("No data returned from BigQuery.")
+    st.error("Dataset empty.")
     st.stop()
 
 # =====================================================
-# FILTER PANEL
+# HEALTH PANEL
+# =====================================================
+
+with st.expander("System Diagnostics", expanded=False):
+
+    st.write("Rows:", len(df_raw))
+    st.write("Columns:", len(df_raw.columns))
+    st.write("Detected themes:", len(st.session_state["theme_cols"]))
+
+    if issues:
+        st.warning("Schema issues detected")
+        for i in issues:
+            st.write("-", i)
+    else:
+        st.success("Schema OK")
+
+# =====================================================
+# FILTERS
 # =====================================================
 
 with st.sidebar:
 
-    st.title("Control Panel")
+    st.title("Filters")
 
-    min_d = df_raw["at"].min().date()
-    max_d = df_raw["at"].max().date()
+    min_d=df_raw["at"].min().date()
+    max_d=df_raw["at"].max().date()
 
-    dr = st.date_input("Date Range",[min_d,max_d])
+    dr=st.date_input("Date",[min_d,max_d])
 
-    brands = sorted(df_raw["brand_name"].dropna().unique())
-    sel_brands = st.multiselect("Brand",brands,default=brands)
+    brands=sorted(df_raw["brand_name"].dropna().unique())
+    sel_brands=st.multiselect("Brand",brands,brands)
 
-    ratings = st.multiselect("Ratings",[1,2,3,4,5],[1,2,3,4,5])
+    ratings=st.multiselect("Rating",[1,2,3,4,5],[1,2,3,4,5])
 
-# =====================================================
-# FILTER LOGIC
-# =====================================================
-
-mask = pd.Series(True,index=df_raw.index)
+mask=pd.Series(True,index=df_raw.index)
 
 if len(dr)==2:
     mask &= df_raw["at"].between(
@@ -175,9 +198,9 @@ if len(dr)==2:
 mask &= df_raw["brand_name"].isin(sel_brands)
 mask &= df_raw["score"].isin(ratings)
 
-df = df_raw[mask]
+df=df_raw[mask]
 
-theme_cols = st.session_state.get("theme_cols",[])
+theme_cols=st.session_state["theme_cols"]
 
 # =====================================================
 # KPI STRIP
@@ -185,54 +208,51 @@ theme_cols = st.session_state.get("theme_cols",[])
 
 st.title("Strategic Intelligence Platform")
 
-last = st.session_state.get("last_fetched","now")
-st.caption(f"Last refresh → {last}")
+c1,c2,c3,c4=st.columns(4)
 
-c1,c2,c3,c4 = st.columns(4)
+vol=len(df)
+avg=df["score"].mean()
 
-vol = len(df)
-avg = df["score"].mean()
+prom=len(df[df.score==5])
+det=len(df[df.score<=3])
+nps=((prom-det)/vol*100) if vol else 0
 
-prom = len(df[df.score==5])
-det = len(df[df.score<=3])
-nps = ((prom-det)/vol*100) if vol else 0
-
-risk = len(df[df.score==1])/vol*100 if vol else 0
+risk=len(df[df.score==1])/vol*100 if vol else 0
 
 c1.metric("Volume",vol)
-c2.metric("Avg Rating",f"{avg:.2f}")
-c3.metric("NPS Proxy",f"{nps:.0f}")
-c4.metric("Critical Risk %",f"{risk:.1f}")
+c2.metric("Avg Rating",round(avg,2))
+c3.metric("NPS Proxy",round(nps))
+c4.metric("Critical Risk %",round(risk,1))
 
 # =====================================================
 # BRAND PERFORMANCE
 # =====================================================
 
-st.subheader("Brand Performance")
+st.subheader("Brand Positioning")
 
-brand = df.groupby("brand_name").agg(
+brand=df.groupby("brand_name").agg(
     Reviews=("score","count"),
     Rating=("score","mean")
 ).reset_index()
 
 st.dataframe(brand,use_container_width=True)
 
-fig = px.scatter(
-    brand,
-    x="Reviews",
-    y="Rating",
-    size="Reviews",
-    hover_name="brand_name",
-    title="Brand Positioning"
+st.plotly_chart(
+    px.scatter(
+        brand,
+        x="Reviews",
+        y="Rating",
+        size="Reviews",
+        hover_name="brand_name"
+    ),
+    use_container_width=True
 )
-
-st.plotly_chart(fig,use_container_width=True)
 
 # =====================================================
 # THEME IMPACT
 # =====================================================
 
-st.subheader("Theme Impact")
+st.subheader("Theme Impact Matrix")
 
 if theme_cols:
 
@@ -248,17 +268,17 @@ if theme_cols:
     if rows:
         imp=pd.DataFrame(rows,columns=["Theme","Freq","Avg","Count"])
 
-        fig=px.scatter(
-            imp,
-            x="Freq",
-            y="Avg",
-            size="Count",
-            text="Theme",
-            color="Avg",
-            title="Impact Matrix"
+        st.plotly_chart(
+            px.scatter(
+                imp,
+                x="Freq",
+                y="Avg",
+                size="Count",
+                text="Theme",
+                color="Avg"
+            ),
+            use_container_width=True
         )
-
-        st.plotly_chart(fig,use_container_width=True)
     else:
         st.info("No theme signals detected.")
 
@@ -284,7 +304,7 @@ if "review_text" in df.columns:
 
     st.subheader("Top Words")
 
-    stop=set(["the","and","for","this","that","app","loan","good","bad"])
+    stop={"the","and","for","this","that","app","loan"}
 
     counter=Counter()
 
@@ -295,18 +315,19 @@ if "review_text" in df.columns:
 
     words=pd.DataFrame(counter.most_common(20),columns=["Word","Count"])
 
-    st.plotly_chart(
-        px.bar(words,x="Count",y="Word",orientation="h"),
-        use_container_width=True
-    )
+    st.plotly_chart(px.bar(words,x="Count",y="Word",orientation="h"),use_container_width=True)
 
 # =====================================================
-# RAW TABLE
+# RAW DATA
 # =====================================================
 
 st.subheader("Raw Data")
 
 st.dataframe(df,use_container_width=True)
 
-csv=df.to_csv(index=False).encode("utf-8")
-st.download_button("Download CSV",csv,"data.csv","text/csv")
+st.download_button(
+    "Download CSV",
+    df.to_csv(index=False).encode("utf-8"),
+    "data.csv",
+    "text/csv"
+)
